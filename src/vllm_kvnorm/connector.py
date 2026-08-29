@@ -32,7 +32,7 @@ Consequences:
 * the cost is a growing score buffer per in-flight request, plus incremental
   block-table tracking.
 
-Only the first KV cache group is scored.
+The first KV cache group with supported attention layers is scored.
 """
 
 from __future__ import annotations
@@ -245,6 +245,10 @@ class _WorkerSide:
         ]
         self._layouts: dict[str, LayerLayout] = {}
         self._layers: list[LayerLayout] = []
+        # Index into kv_cache_groups / StepRequest.new_block_ids of the group we
+        # actually score. For dense models this is 0; for hybrid models the
+        # attention group sits at a non-zero index (see score_step).
+        self._score_group_idx = 0
         self._block_size = 0
         self._state: dict[str, _RequestState] = {}
         self._emitted: set[str] = set()
@@ -272,11 +276,20 @@ class _WorkerSide:
                 except UnsupportedLayout as exc:
                     logger.warning("kvnorm: %s", exc)
 
-        # Only the first KV cache group is scored; see module docstring.
-        if self._groups:
-            self._layers = [
-                self._layouts[n] for n in self._groups[0][0] if n in self._layouts
-            ]
+        # Score the first KV cache group that has supported attention layers.
+        # For hybrid models (e.g. Qwen3.8-27B with linear_attention + full_attention
+        # groups), the first group may be Mamba/linear-attention with no num_kv_heads,
+        # so we scan forward until we find a group with resolved layouts.
+        # We must also *record* that group's index: StepRequest.new_block_ids is a
+        # tuple with one block-id list per kv_cache_group, ordered identically to
+        # kv_cache_groups. score_step indexes it by _score_group_idx so it applies
+        # the attention group's own block table (not group 0's Mamba blocks).
+        for gi, (layer_names, _spec) in enumerate(self._groups):
+            candidate = [self._layouts[n] for n in layer_names if n in self._layouts]
+            if candidate:
+                self._layers = candidate
+                self._score_group_idx = gi
+                break
         if self._tp_size > 1:
             from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
@@ -323,8 +336,16 @@ class _WorkerSide:
                     st.prompt_token_ids = step_req.prompt_token_ids
 
                 if step_req.new_block_ids:
-                    st.blocks.extend(step_req.new_block_ids[0])
-                    st.table = torch.tensor(st.blocks, dtype=torch.int32, device=device)
+                    # new_block_ids has one block-id list per kv_cache_group, in
+                    # the same order as kv_cache_groups. We score the attention
+                    # group at _score_group_idx, so we must extend from that
+                    # group's block table -- not group 0, which for hybrid models
+                    # is a Mamba/linear-attention block table and would apply the
+                    # wrong physical blocks to the attention layers (-> NaN).
+                    gi = self._score_group_idx
+                    if gi < len(step_req.new_block_ids):
+                        st.blocks.extend(step_req.new_block_ids[gi])
+                        st.table = torch.tensor(st.blocks, dtype=torch.int32, device=device)
                 if st.table is None:
                     continue
 
@@ -395,7 +416,7 @@ class _WorkerSide:
             metadata={
                 "metric": "pagedeviction_v_over_k_l2",
                 "metric_reference": "arXiv:2509.04377 Algorithm 1",
-                "kv_cache_group_id": 0,
+                "kv_cache_group_id": self._score_group_idx,
                 "num_layers": len(self._layers),
                 "num_kv_heads": self._layers[0].num_kv_heads,
                 "num_tokens": st.total,
