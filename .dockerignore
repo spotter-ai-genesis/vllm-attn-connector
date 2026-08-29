@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.venv
+*.egg-info
+build/
+dist/
+*.sif
+output/
