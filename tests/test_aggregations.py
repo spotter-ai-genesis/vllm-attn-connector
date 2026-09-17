@@ -141,8 +141,151 @@ def main() -> int:
     test_owner_reduction()
     print()
     test_group_block_ids()
+    print()
+    test_registry_freshness()
     print("\nall checks passed")
     return 0
+
+
+# --------------------------------------------------------------------------
+# Query registry freshness. The probe half of the CUDA-graph fix, and the part
+# that has no GPU in it.
+# --------------------------------------------------------------------------
+
+def _load_registry(capturing):
+    """Pull QueryRegistry out of probe.py without importing it.
+
+    probe.py imports vllm.logger at module scope and asks torch whether the
+    current stream is capturing a CUDA graph; neither is available here, so
+    both are substituted. `capturing` is a one-element list the test flips to
+    say "this write is being recorded into a graph".
+    """
+    import ast as _ast
+    import pathlib
+    import threading
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src/vllm_attn_connector/probe.py").read_text()
+    tree = _ast.parse(src)
+    mod = _ast.Module(body=[n for n in tree.body
+                            if isinstance(n, _ast.ClassDef)
+                            and n.name == "QueryRegistry"],
+                      type_ignores=[])
+
+    class _Log:
+        def __init__(self):
+            self.warnings = 0
+
+        def warning(self, *a, **k):
+            self.warnings += 1
+
+    log = _Log()
+    ns = {"torch": torch, "threading": threading, "logger": log,
+          "_capturing": lambda: capturing[0]}
+    exec(compile(mod, "<probe>", "exec"), ns)
+    assert "QueryRegistry" in ns, "probe.py no longer defines QueryRegistry"
+    return ns["QueryRegistry"], log
+
+
+def test_registry_freshness() -> None:
+    cap = [False]
+    QueryRegistry, log = _load_registry(cap)
+    print("query registry: persistent buffers, per-step freshness")
+
+    reg = QueryRegistry()
+    reg.configure(8)
+    q = torch.arange(8 * 2 * 3, dtype=torch.float32).reshape(8, 2, 3)
+
+    # --- live write: fresh only for the step it ran on --------------------
+    reg.put("l0", q, 3)
+    assert reg.get("l0", 3) is not None, "a live write is readable this step"
+    assert torch.equal(reg.get("l0", 3)[:3], q[:3])
+    assert reg.get("l0", 5) is None, "a live write of 3 rows cannot serve 5"
+    reg.end_step()
+    assert reg.get("l0", 3) is None, \
+        "a live write must not survive into the next step"
+    print("  ok  live write is fresh for its own step, for the rows it covered")
+
+    # --- recorded write: the graph's copy reruns on every replay ----------
+    cap[0] = True
+    reg.put("l0", q, 8)
+    cap[0] = False
+    for _ in range(50):
+        reg.end_step()
+    assert reg.get("l0", 8) is not None, \
+        "a recorded copy reruns on every replay; it must stay readable"
+    assert reg.get("l0", 4) is not None, "a smaller decode batch replays too"
+    assert reg.graph_rows("l0") == 8
+    assert reg.get("nosuch", 1) is None
+    print("  ok  recorded write stays fresh across steps, up to the rows it covers")
+
+    # --- a batch wider than any captured graph is not covered -------------
+    small = QueryRegistry()
+    small.put("l0", q, 2)          # the warmup that allocates, outside capture
+    cap[0] = True
+    small.put("l0", q, 2)
+    cap[0] = False
+    small.end_step()
+    assert small.get("l0", 2) is not None
+    assert small.get("l0", 4) is None, \
+        "no graph writes 4 rows, so 4 rows cannot be read back"
+    print("  ok  a decode batch wider than any captured graph is refused")
+
+    # --- nothing recorded at all: every step is refused -------------------
+    none_ = QueryRegistry()
+    none_.put("l0", q, 4)
+    none_.end_step()
+    assert none_.get("l0", 4) is None, \
+        "cudagraph_mode=FULL records no decode copy; refuse rather than guess"
+    print("  ok  with no recorded copy every later step is refused")
+
+    # --- allocating while a graph is capturing is refused, not silently
+    #     taken from the graph's private pool -----------------------------
+    nobuf = QueryRegistry()
+    cap[0] = True
+    nobuf.put("l0", q, 8)
+    cap[0] = False
+    assert nobuf.get("l0", 8) is None and nobuf.graph_rows("l0") == 0, \
+        "a capture that found no buffer must record no coverage"
+    print("  ok  a capture with no buffer to write into is refused and warns")
+
+    # --- the buffer is the same object, which is what replay depends on ---
+    before = reg.get("l0", 8)
+    cap[0] = True
+    reg.put("l0", q * 2, 8)
+    cap[0] = False
+    after = reg.get("l0", 8)
+    assert before.data_ptr() == after.data_ptr(), \
+        "the buffer must be written in place, not replaced"
+    assert torch.equal(after, q * 2)
+    print("  ok  writes land in the same buffer, in place")
+
+    # --- growing after capture costs the graphs recorded against the old --
+    grow = QueryRegistry()
+    grow.put("l0", q, 2)
+    cap[0] = True
+    grow.put("l0", q, 2)
+    cap[0] = False
+    grow.end_step()
+    assert grow.get("l0", 2) is not None
+    before_warnings = log.warnings
+    grow.put("l0", q, 8)
+    assert log.warnings > before_warnings, "growing past a capture must warn"
+    assert grow.graph_rows("l0") == 0, \
+        "graphs recorded against the old buffer no longer write the new one"
+    print("  ok  a buffer that has to grow drops the coverage it invalidates "
+          "and warns")
+
+    # --- configure() sizes it once, so capture never has to grow it -------
+    sized = QueryRegistry()
+    sized.configure(64)
+    sized.put("l0", q, 2)
+    assert sized.get("l0", 2).shape[0] == 64, "configure(64) sizes the buffer"
+    ptr = sized.get("l0", 2).data_ptr()
+    sized.end_step()
+    sized.put("l0", q, 8)
+    assert sized.get("l0", 8).data_ptr() == ptr, \
+        "a later, wider write must reuse the buffer configure() sized"
+    print("  ok  configure() sizes the buffer once and later writes reuse it")
 
 
 # --------------------------------------------------------------------------

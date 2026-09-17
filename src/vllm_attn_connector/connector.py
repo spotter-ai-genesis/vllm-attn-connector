@@ -151,6 +151,43 @@ def _model_conf(vllm_config: "VllmConfig") -> dict[str, Any]:
     return conf
 
 
+def _configure_registry(vllm_config: "VllmConfig") -> None:
+    """Tell the probe how tall its per-layer query buffers must be.
+
+    The probe writes into one persistent buffer per layer and CUDA graphs
+    record a copy into it, so the buffer has to be its final size *before*
+    capture: a graph recorded against an older, shorter buffer would keep
+    writing there. The worker connector is built before
+    ``compile_or_warm_up_model`` runs, which is early enough.
+
+    The height is the largest decode row count the probe can ever see, which is
+    the larger of two numbers, not the smaller. ``max_num_seqs`` bounds a decode
+    batch, since ``max_query_len == 1`` means one row per request, and it can
+    exceed ``max_cudagraph_capture_size``: vLLM warms up at ``max_num_seqs``
+    rows *after* capturing graphs, so sizing to the capture size alone makes the
+    buffer grow once capture is over and costs every captured graph its copy
+    (observed on opt-125m, job 3166664: 512 vs 1024, all 51 graphs invalidated).
+    ``max_cudagraph_capture_size`` is kept in the max anyway, for the case where
+    sequence-parallel padding pushes a captured size past ``max_num_seqs``.
+    """
+    try:
+        cc = vllm_config.compilation_config
+        if getattr(cc.cudagraph_mode, "value", 0) == 0:
+            return
+        size = int(cc.max_cudagraph_capture_size or 0)
+        seqs = int(vllm_config.scheduler_config.max_num_seqs or 0)
+        rows = max(size, seqs)
+        if not rows:
+            return
+        REGISTRY.configure(rows)
+        logger.info("attn_connector: query buffers sized for %d decode row(s) "
+                    "(max_num_seqs=%d, max_cudagraph_capture_size=%d, "
+                    "cudagraph_mode=%s)", rows, seqs, size, cc.cudagraph_mode)
+    except Exception as exc:  # pragma: no cover - config shape is vLLM's
+        logger.warning("attn_connector: could not size the query buffers "
+                       "ahead of CUDA graph capture: %s", exc)
+
+
 @dataclass
 class StepRequest:
     request_id: str
@@ -290,7 +327,8 @@ class _RequestState:
 
     __slots__ = ("blocks", "table", "scratch", "colsum", "pos", "val",
                  "resid",
-                 "prompt_len", "steps", "dropped", "prompt_token_ids", "event", "started",
+                 "prompt_len", "steps", "dropped", "unscored", "prompt_token_ids",
+                 "event", "started",
                  "seen_computed", "restarts", "k", "plan", "seg_idx", "seg_live",
                  "seg_want", "seg_kmax", "ranges", "n_keys", "owner", "head",
                  "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
@@ -309,6 +347,10 @@ class _RequestState:
         self.prompt_len = 0
         self.steps = 0
         self.dropped = 0
+        # Decode steps this request produced that nothing could score. Zero is
+        # the only healthy value; anything else means records are missing rows
+        # they should have, which is what issue #2 had no way to say.
+        self.unscored = 0
         self.prompt_token_ids = prompt_token_ids or []
         self.event: torch.cuda.Event | None = None
         self.started = time()
@@ -454,6 +496,7 @@ class _RequestState:
             self.table = [None] * len(self.blocks)
             self.prompt_len = 0
             self.steps = 0
+            self.unscored = 0
             self.restarts += 1
             self.k = None
             self.n_keys = 0
@@ -486,7 +529,6 @@ class _WorkerSide:
         self._out_dir = Path(out_dir).expanduser().resolve()
         self._checksum = bool(checksum)
         self._layer_stats = bool(layer_stats)
-        self._missing_q = 0
 
         self._groups = [(list(g.layer_names), g.kv_cache_spec)
                         for g in kv_cache_config.kv_cache_groups]
@@ -501,6 +543,11 @@ class _WorkerSide:
         self._stream: torch.cuda.Stream | None = None
         self._scratch: torch.Tensor | None = None
         self._enabled = False
+        # Decode steps that arrived with no queries to score them with.
+        self._no_query_steps = 0
+        # Decode widths already reported, so the log says once per width how
+        # the queries reached the connector and then stops.
+        self._widths_logged: set = set()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         for layer_names, spec in self._groups:
@@ -597,17 +644,30 @@ class _WorkerSide:
 
     # -- per-step ----------------------------------------------------------- #
 
-    def _warn_no_query(self, layer_name: str, rows: int) -> None:
-        """Complain once. A silent skip here produces all-zero records that pass
-        every structural check -- mass still "conserves", because 0 + 1 == 1."""
-        self._missing_q += 1
-        if self._missing_q == 1:
-            logger.warning(
-                "attn_connector: no decode queries for layer %s at %d row(s) "
-                "(buffer capacity %d). Scores for this step will be zero. If "
-                "this persists the probe is not reaching the forward -- check "
-                "install_probe() ran before the engine was built.",
-                layer_name, rows, REGISTRY.max_rows)
+    def _warn_no_queries(self, missing: list[str], n_reqs: int) -> None:
+        """Say so when a decode step arrives with no queries to score it with.
+
+        This used to be a silent `continue` per layer, and that is how issue #2
+        ran for weeks: under CUDA graphs the probe's Python body never ran on a
+        replayed step, every layer resolved to None, and the connector emitted
+        records that were structurally perfect and numerically zero. Rate
+        limited to powers of two so a permanently broken configuration says so
+        at startup without drowning the log.
+        """
+        self._no_query_steps += 1
+        c = self._no_query_steps
+        if c & (c - 1):
+            return
+        logger.warning(
+            "attn_connector: %d decode step(s) unscored: no queries for %d "
+            "layer(s) (%s%s) on a %d-request step. The probe neither ran this "
+            "step nor recorded a copy into a CUDA graph that covers %d row(s) "
+            "(it covers up to %d), so the records for these requests will be "
+            "empty. cudagraph_mode=FULL without PIECEWISE is the known "
+            "configuration that does this.",
+            c, len(missing), ", ".join(missing[:3]),
+            ", ..." if len(missing) > 3 else "", n_reqs, n_reqs,
+            REGISTRY.graph_rows(missing[0]) if missing else 0)
 
     def score_step(self, meta: AttnMetadata) -> None:
         """Score the decode queries this step produced, on the side stream."""
@@ -616,7 +676,8 @@ class _WorkerSide:
         device = self._scored[0].layers[0].k_view.device
         stream = self._stream
         assert stream is not None
-        stream.wait_stream(torch.cuda.current_stream())
+        main = torch.cuda.current_stream()
+        stream.wait_stream(main)
 
         # vLLM v1 orders decode requests first, one token each, so row i of the
         # captured queries is the i-th decoding request in scheduler order.
@@ -633,19 +694,54 @@ class _WorkerSide:
             return sr.num_computed_tokens >= n_prompt if n_prompt else True
 
         decoding = [s for s in meta.scheduled if _is_decode(s)]
-        # Under CUDA graphs the probe's Python does not run on replay, so it has
-        # no count to cross-check against; the scheduler's is the only one. When
-        # it *did* run (eager), disagreement means the batch is not laid out the
-        # way decode assumes, so drop the step rather than mis-attribute.
-        if decoding and REGISTRY.ran_eagerly:
-            n_probe = REGISTRY.num_decode_reqs
-            if n_probe != len(decoding):
-                logger.warning(
-                    "attn_connector: probe saw %d decode rows but the scheduler lists %d; "
-                    "skipping this step rather than mis-attributing.", n_probe, len(decoding)
-                )
-                decoding = []
-        n_rows = len(decoding)
+        # Row i is request slot i only if every row in the batch is a one-token
+        # decode. A chunked-prefill remainder is one token too and looks the
+        # same from here, so check the batch's whole token count against the
+        # decodes we recognise. This used to compare against the probe's own
+        # row count; under a replayed CUDA graph that is the padded capture
+        # size, which says nothing about the step in front of us.
+        n_tokens = sum(s.num_scheduled_tokens for s in meta.scheduled)
+        unscored: list[StepRequest] = []
+        if decoding and n_tokens != len(decoding):
+            unscored, decoding = decoding, []
+
+        # Resolve every layer's queries up front, and take a private copy of
+        # the rows this step owns. Two reasons, both new with the CUDA-graph
+        # fix: a partially-resolved step is what produced well-formed all-zero
+        # records (issue #2), and the probe's buffers are now persistent, so
+        # the next forward rewrites them in place while this step's scoring is
+        # still reading. The copy is `n_reqs x heads x head_size` per layer.
+        queries: dict[str, torch.Tensor] = {}
+        if decoding:
+            n_rows, raw, missing = len(decoding), {}, []
+            for group in self._scored:
+                for layout in group.layers:
+                    q = REGISTRY.get(layout.layer_name, n_rows)
+                    if q is None:
+                        missing.append(layout.layer_name)
+                    else:
+                        raw[layout.layer_name] = q
+            if missing:
+                self._warn_no_queries(missing, n_rows)
+                unscored, decoding = decoding, []
+            else:
+                if (n_rows not in self._widths_logged
+                        and len(self._widths_logged) < 12):
+                    self._widths_logged.add(n_rows)
+                    name = self._scored[0].layers[0].layer_name
+                    logger.info(
+                        "attn_connector: scoring a %d-row decode step; the "
+                        "probe's recorded copies cover up to %d row(s)",
+                        n_rows, REGISTRY.graph_rows(name))
+                with torch.cuda.stream(stream):
+                    queries = {name: q[:n_rows].clone()
+                               for name, q in raw.items()}
+                copied = torch.cuda.Event()
+                copied.record(stream)
+                # Hold the next forward only until the copy lands, not until
+                # the scoring finishes: the point of the side stream is that
+                # the q.K^T work overlaps the next step.
+                main.wait_event(copied)
 
         with torch.cuda.stream(stream):
             for step_req in meta.scheduled:
@@ -680,6 +776,11 @@ class _WorkerSide:
                         st.prompt_len,
                         step_req.num_computed_tokens + step_req.num_scheduled_tokens,
                     )
+
+            for step_req in unscored:
+                st = self._state.get(step_req.request_id)
+                if st is not None:
+                    st.unscored += 1
 
             for row_i, step_req in enumerate(decoding):
                 st = self._state[step_req.request_id]
@@ -727,10 +828,7 @@ class _WorkerSide:
                     row.zero_()
                     st.owner[gi, :n_keys].fill_(-1)
                     for li, layout in enumerate(group.layers):
-                        q = REGISTRY.get(layout.layer_name, n_rows)
-                        if q is None:
-                            self._warn_no_query(layout.layer_name, n_rows)
-                            continue
+                        q = queries[layout.layer_name]
                         probs = decode_attention(
                             q[row_i], layout.k_view, st.table[gi], n_keys,
                             num_query_heads=self._num_q_heads,
@@ -909,6 +1007,10 @@ class _WorkerSide:
                         written_by_tp_rank=self._tp_rank,
                         segment_mode=mode,
                         decode_steps_dropped=st.dropped,
+                        # Decode steps nothing could score. Nonzero means the
+                        # probe did not reach the forward on those steps; see
+                        # issue #2.
+                        decode_steps_unscored=st.unscored,
                         decode_steps_nonfinite=n_bad,
                         restarts=st.restarts)
 
@@ -1157,15 +1259,10 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             self._scheduler = _SchedulerSide()
         else:
+            _configure_registry(vllm_config)
             parent = extra.get("workflow_id")
             wf = f"vllm-attn-{uuid.uuid4().hex[:12]}"
             logger.info("attn_connector: workflow_id=%s parent=%s", wf, parent)
-            # Size the probe's buffers before anything runs a forward. They
-            # must exist before the first CUDA graph is captured, because each
-            # graph records the buffer's address; reallocating later would
-            # leave already-captured graphs writing somewhere nobody reads.
-            REGISTRY.max_rows = int(
-                getattr(vllm_config.scheduler_config, "max_num_seqs", 0) or 256)
             self._worker = _WorkerSide(
                 kv_cache_config, conf=_model_conf(vllm_config),
                 tp_size=vllm_config.parallel_config.tensor_parallel_size,
@@ -1228,7 +1325,13 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
             if isinstance(meta, AttnMetadata):
                 self._worker.score_step(meta)
         finally:
-            REGISTRY.begin_step()
+            # Retire this step's *live* probe writes. Deliberately not a clear:
+            # under CUDA graphs the probe's Python body runs only while vLLM
+            # captures the graph, so dropping the buffers would leave every
+            # replayed step with nothing to read -- which is issue #2. The
+            # buffers persist and `end_step` is what makes a write from an
+            # earlier eager step stop counting as fresh.
+            REGISTRY.end_step()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return

@@ -5,6 +5,11 @@ validates the Flowcept records -- including that the recomputed attention is
 real attention and not a plausible-looking artifact.
 
 Run: python e2e_smoke.py --model Qwen/Qwen2.5-0.5B-Instruct
+
+CUDA graphs are on by default, because that is the configuration `vllm serve`
+uses and it has its own failure mode: the probe's Python body runs only while
+vLLM captures the graph, never on a replayed step. `--enforce-eager` runs the
+graphs-off path, `--cuda-graphs` forces graphs on.
 """
 
 from __future__ import annotations
@@ -69,6 +74,8 @@ def run(args) -> list[dict]:
             gpu_memory_utilization=args.gpu_memory_utilization,
             enforce_eager=args.enforce_eager,
         )
+        print(f"\n=== enforce_eager={args.enforce_eager} "
+              f"(cuda graphs {'off' if args.enforce_eager else 'ON'}) ===")
         # ignore_eos: every prompt must produce exactly MAX_TOKENS tokens.
         # Without it a model that stops early leaves a record with a single
         # decode step, and the unbounded-growth checks below fail for a
@@ -319,6 +326,10 @@ def main() -> int:
                     help="disable CUDA graphs; the default runs with them ON, "
                          "because that is how vllm serve runs and the probe has "
                          "to survive graph replay")
+    ap.add_argument("--cuda-graphs", action="store_true",
+                    help="force CUDA graphs on. That is the default now, so "
+                         "this only overrides an earlier --enforce-eager; kept "
+                         "because the deploy scripts pass it explicitly")
     ap.add_argument("--ranges", action="store_true",
                     help="declare per-request prompt ranges (variable segments)")
     ap.add_argument("--out-dir", default="./attention_provenance",
@@ -330,6 +341,10 @@ def main() -> int:
     ap.add_argument("--chunk-size", type=int, default=32,
                     help="prefill tokens per selection chunk; 0 = global selection")
     args = ap.parse_args()
+    # --cuda-graphs wins over --enforce-eager, so a script can pass it
+    # unconditionally to mean "the served configuration".
+    if args.cuda_graphs:
+        args.enforce_eager = False
     return validate(run(args), num_requests=len(PROMPTS), top_pct=args.top_pct,
                     max_steps=args.max_steps, chunk=args.chunk_size,
                     ranges=RANGES if args.ranges else None)
