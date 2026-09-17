@@ -69,7 +69,13 @@ def run(args) -> list[dict]:
             gpu_memory_utilization=args.gpu_memory_utilization,
             enforce_eager=args.enforce_eager,
         )
-        sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+        # ignore_eos: every prompt must produce exactly MAX_TOKENS tokens.
+        # Without it a model that stops early leaves a record with a single
+        # decode step, and the unbounded-growth checks below fail for a
+        # reason that has nothing to do with capture. Qwen/Qwen3.8-27B ends
+        # the haiku prompt after one token (job 3164392).
+        sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS,
+                            ignore_eos=True)
         if args.ranges:
             # Per-request prompt ranges, vLLM's standard connector channel.
             sp.extra_args = {"kv_transfer_params": {"ranges": RANGES}}
