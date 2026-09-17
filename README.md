@@ -65,28 +65,34 @@ step N
 | `q·Kᵀ`, softmax, reduce | one matvec per request per layer | no — side stream |
 | `event.synchronize()` at finish | one event per request | yes, once |
 
-Two implementation notes that are easy to get wrong if you fork this:
+Three implementation notes that are easy to get wrong if you fork this:
 
 **The probe overrides the backend impl, not the `Attention` module.**
 `Attention.forward` is traced through by `torch.compile`; only the custom op
 `unified_attention_with_output` survives as a runtime node, and it dispatches
-`self.impl.forward(...)` dynamically. An `nn.Module` forward hook would not fire
-at all.
+`self.impl.forward(...)` dynamically. An `nn.Module` forward hook is erased by
+the trace and would never fire at all.
 
-**The query copy targets a persistent buffer, because CUDA graphs replay
-kernels and not Python.** Being on the traced path is necessary but not
-sufficient: a graph records the kernels a trace emits once, and replay re-runs
-only those kernels. Any Python in the probe — a dict write, an allocation —
-executes at capture time and never again. What does re-run is the copy itself,
-so the probe allocates one buffer per layer, sized to `max_num_seqs`, before
-capture, and every graph records a copy into a prefix of it. After any replay
-the first `m` rows hold the current step's queries.
+**Surviving the trace is not surviving CUDA graphs.** A graph records the
+kernels one execution of the trace produced; a replay runs those kernels and no
+Python. So the probe's Python body runs once, while vLLM captures the graph,
+and never again — which under `vllm serve` is every decode step, because vLLM
+captures a full graph per decode batch size by default. The probe therefore
+keeps one persistent buffer per layer and *copies into it*, so the copy is a
+recorded kernel that every replay re-runs. Nothing is cleared between steps.
 
-This matters because CUDA graphs are on by default in `vllm serve`. Getting it
-wrong is silent rather than loud: the connector still emits structurally valid
-records, they are just all zero, and even mass conservation still "passes"
-because `0 + 1 == 1`. The e2e therefore runs with graphs **on** by default and
-asserts that `attn_sum` totals one softmax unit per decode step.
+Instead the probe asks `torch.cuda.is_current_stream_capturing()` and so knows
+whether its copy is being *recorded* or *executed*. A recorded copy covers
+every later replay of that graph, up to the decode batch size it was recorded
+for; an executed copy covers only the step it ran on, tracked by a generation
+the connector bumps once per step. The connector cannot ask which graph is
+being replayed — `wait_for_save` runs from `post_forward`, outside
+`set_forward_context` — so it asks the probe how many decode rows its recorded
+copies cover, which is a question the probe can answer for itself.
+
+A decode step with no queries for some layer is a warning and a
+`decode_steps_unscored` count, never a silent empty record — that combination
+is what [issue #2](docs/issues/cuda-graph-probe.md) shipped.
 
 **Decode only.** In decode each request contributes exactly one query token, so
 batch row *i* is request slot *i* — no `query_start_loc` parsing and no
@@ -494,5 +500,16 @@ and single-key sequences.
 - **Preemption drops partial records.** If a request is preempted and restarted,
   steps recorded before the restart are discarded rather than stitched, and
   `restarts` is incremented.
+- **`cudagraph_mode=FULL` without `PIECEWISE` captures no decode queries.**
+  That mode captures only mixed-shaped graphs, which the probe skips because
+  `max_query_len != 1`, and dispatches pure decode batches to them. Those steps
+  warn and count as `decode_steps_unscored` instead of being scored. The
+  default `FULL_AND_PIECEWISE`, and `FULL_DECODE_ONLY`, `PIECEWISE` and `NONE`,
+  all capture queries.
+- **Mixed prefill+decode steps are not scored.** `max_query_len != 1` breaks
+  the "batch row *i* is request slot *i*" identity the probe relies on, so
+  those steps are skipped and counted in `decode_steps_unscored` rather than
+  mis-attributed. Under continuous batching with chunked prefill this costs a
+  few decode steps per request at most.
 - **`layout.py` is vendored**, duplicated with `vllm-kvnorm`. If a third package
   needs it, extract a shared dependency instead of copying again.
