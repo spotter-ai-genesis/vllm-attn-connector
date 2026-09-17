@@ -129,6 +129,21 @@ def _model_conf(vllm_config: "VllmConfig") -> dict[str, Any]:
     conf["dtype"] = str(m.dtype)
     conf["architectures"] = list(getattr(m, "architectures", []) or [])
     conf["tensor_parallel_size"] = vllm_config.parallel_config.tensor_parallel_size
+    # Head counts as vLLM itself resolves them, already divided by the TP size,
+    # so this rank's slice. Asking vLLM instead of re-reading the HF config is
+    # the only reliable way: Qwen/Qwen3.8-27B keeps num_attention_heads=24 and
+    # num_key_value_heads=4 under `text_config`, invisible at the top level, and
+    # a top-level lookup silently falls back to the wrong number.
+    par = vllm_config.parallel_config
+    for key, getter in (("num_query_heads_per_rank", "get_num_attention_heads"),
+                        ("num_kv_heads_per_rank", "get_num_kv_heads")):
+        fn = getattr(m, getter, None)
+        if fn is None:
+            continue
+        try:
+            conf[key] = int(fn(par))
+        except Exception as exc:
+            logger.warning("attn_connector: %s(parallel_config) failed: %s", getter, exc)
     for k in ("revision", "tokenizer_revision", "served_model_name"):
         v = getattr(m, k, None)
         if v:
@@ -558,18 +573,27 @@ class _WorkerSide:
         )
 
     def _infer_query_heads(self) -> int:
-        n = self._conf.get("num_attention_heads")
-        if n:
-            return int(n) // max(1, self._tp_size)
-        try:
-            from transformers import AutoConfig
+        """Query heads this rank holds, from `VllmConfig` (see `_model_conf`).
 
-            cfg = AutoConfig.from_pretrained(
-                self._conf["model"], trust_remote_code=self._conf.get("trust_remote_code", False)
-            )
-            return int(cfg.num_attention_heads) // max(1, self._tp_size)
-        except Exception:
-            return self._scored[0].layers[0].num_kv_heads
+        The number decides the GQA fan-out the kernel applies, so guessing it
+        is not survivable: too small and only the first few query heads are
+        scored, each against the KV head with the same index rather than its
+        own, which is a different model's attention.
+        """
+        n = self._conf.get("num_query_heads_per_rank")
+        if n:
+            logger.info("attn_connector: %d query head(s) per rank, from VllmConfig", n)
+            return int(n)
+        # Only reachable if ModelConfig loses the accessor. num_kv_heads is
+        # right for MHA and too small for anything with GQA, so say so loudly
+        # rather than emit scores nobody can tell apart from correct ones.
+        fallback = self._scored[0].layers[0].num_kv_heads
+        logger.warning(
+            "attn_connector: VllmConfig did not report a query head count; "
+            "falling back to num_kv_heads=%d. This is correct only for MHA; "
+            "under GQA the scores will cover a fraction of the query heads and "
+            "pair them with the wrong KV heads.", fallback)
+        return fallback
 
     # -- per-step ----------------------------------------------------------- #
 

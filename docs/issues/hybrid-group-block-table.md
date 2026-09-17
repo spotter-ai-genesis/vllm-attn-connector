@@ -101,17 +101,9 @@ separate commit.
 
 Full job table in `deploy/ATTN_FIX_VALIDATION.md`.
 
-## Still wrong, not fixed here
+## Found on the way
 
-`_infer_query_heads` returns 4 on Qwen3.8-27B, where the model has 24 query
-heads over 4 KV heads (`text_config.num_attention_heads=24`,
-`num_key_value_heads=4`). `_model_conf` never puts `num_attention_heads` into
-`self._conf`, so the fast path is dead and the AutoConfig path misses the value
-because this config keeps it under `text_config`. The except branch then falls
-back to `num_kv_heads`. The kernel is handed `num_query_heads=4`, computes a
-GQA fan-out of 1, scores only the first 4 of 24 query heads and pairs 3 of
-those with the wrong KV head. The connector logs "16 layers in 1 group(s), 4 query
-heads / 4 kv heads" on every Qwen3.8-27B run in
-`deploy/ATTN_FIX_VALIDATION.md`. It does not affect which blocks are read, so
-it is orthogonal to this fix, but the Qwen numbers above are over 4 mismatched
-heads rather than 24 correct ones.
+`_infer_query_heads` was returning 4 on Qwen3.8-27B, where the model has 24
+query heads over 4 KV heads, so the Qwen numbers above are over 4 mismatched
+heads. Fixed separately, see `query-head-count.md`; the corrected run is job
+3164478.
