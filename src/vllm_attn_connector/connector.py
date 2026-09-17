@@ -148,6 +148,27 @@ class StepRequest:
     ranges: list | None = None
 
 
+def _group_block_ids(new_block_ids: "tuple[list[int], ...]",
+                     gids: "list[int]") -> "list[list[int]]":
+    """The block ids each scored group owns, in scored order.
+
+    ``StepRequest.new_block_ids`` holds one block-id list per KV cache group,
+    ordered exactly like ``kv_cache_config.kv_cache_groups``. A hybrid model
+    has several groups and the full-attention one is not group 0: measured on
+    Qwen/Qwen3.8-27B with vLLM 0.28.0 there are 4 groups, 0-2 MambaSpec (the 48
+    GDN linear-attention layers, split three ways, num_kv_heads=None, nothing
+    to score) and 3 FullAttentionSpec (16 layers, num_kv_heads=4,
+    head_size=256, block_size=784). Reading index 0 gives the attention layers
+    Mamba physical blocks, so the recomputed scores are garbage or NaN. A dense
+    model has a single group, where index 0 is the right one anyway.
+
+    A gid past the end of the tuple yields an empty list, so a group vLLM did
+    not hand blocks for this step is simply not extended.
+    """
+    return [list(new_block_ids[g]) if g < len(new_block_ids) else []
+            for g in gids]
+
+
 @dataclass
 class AttnMetadata(KVConnectorMetadata):
     scheduled: list[StepRequest] = field(default_factory=list)
@@ -259,9 +280,12 @@ class _RequestState:
                  "seg_want", "seg_kmax", "ranges", "n_keys", "owner", "head",
                  "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
 
-    def __init__(self, prompt_token_ids: list[int] | None):
-        self.blocks: list[int] = []
-        self.table: torch.Tensor | None = None
+    def __init__(self, prompt_token_ids: list[int] | None, n_groups: int = 1):
+        # One block table per scored group, indexed by position in
+        # `_WorkerSide._scored` (not by kv_cache_group_id). See
+        # `_group_block_ids`.
+        self.blocks: list[list[int]] = [[] for _ in range(n_groups)]
+        self.table: list[torch.Tensor | None] = [None] * n_groups
         self.scratch: torch.Tensor | None = None   # (groups, 2, T) acc-mean, running max
         self.colsum: torch.Tensor | None = None    # (groups, 2, T) running sum / max
         self.pos: torch.Tensor | None = None       # (groups, steps, k) int32
@@ -410,8 +434,9 @@ class _RequestState:
         garbage. `num_computed_tokens` going backwards is the signal.
         """
         if num_computed < self.seen_computed:
-            self.blocks.clear()
-            self.table = None
+            for blocks in self.blocks:
+                blocks.clear()
+            self.table = [None] * len(self.blocks)
             self.prompt_len = 0
             self.steps = 0
             self.restarts += 1
@@ -455,7 +480,7 @@ class _WorkerSide:
         self._layouts: dict[str, LayerLayout] = {}
         self._scored: list[_Group] = []
         self._num_q_heads = 0
-        self._block_size = 0
+        self._gids: list[int] = []
         self._state: dict[str, _RequestState] = {}
         self._emitted: set[str] = set()
         self._stream: torch.cuda.Stream | None = None
@@ -512,7 +537,7 @@ class _WorkerSide:
                     "cannot attend to a prompt token at all. Recorded separately.",
                     g.gid, g.kind,
                 )
-        self._block_size = self._scored[0].layers[0].block_size
+        self._gids = [g.gid for g in self._scored]
         self._stream = torch.cuda.Stream()
         self._enabled = True
         if self._tp_rank == 0:
@@ -602,7 +627,8 @@ class _WorkerSide:
             for step_req in meta.scheduled:
                 st = self._state.get(step_req.request_id)
                 if st is None:
-                    st = _RequestState(step_req.prompt_token_ids)
+                    st = _RequestState(step_req.prompt_token_ids,
+                                       len(self._scored))
                     st.ranges = step_req.ranges
                     self._state[step_req.request_id] = st
                 elif step_req.prompt_token_ids:
@@ -614,8 +640,16 @@ class _WorkerSide:
                         step_req.request_id, st.restarts,
                     )
                 if step_req.new_block_ids:
-                    st.blocks.extend(step_req.new_block_ids[0])
-                    st.table = torch.tensor(st.blocks, dtype=torch.int32, device=device)
+                    # Each scored group gets its OWN group's block table. Using
+                    # group 0's for everything is correct only for dense
+                    # models; see `_group_block_ids`.
+                    for gi, new in enumerate(
+                            _group_block_ids(step_req.new_block_ids, self._gids)):
+                        if not new:
+                            continue
+                        st.blocks[gi].extend(new)
+                        st.table[gi] = torch.tensor(st.blocks[gi],
+                                                    dtype=torch.int32, device=device)
                 if step_req.num_scheduled_tokens > 1 or st.prompt_len == 0:
                     # Still prefilling: freeze the prompt length as it grows.
                     st.prompt_len = max(
@@ -625,12 +659,20 @@ class _WorkerSide:
 
             for row_i, step_req in enumerate(decoding):
                 st = self._state[step_req.request_id]
-                if st.table is None or st.prompt_len == 0:
+                if any(t is None for t in st.table) or st.prompt_len == 0:
                     continue
                 if self._max_steps and st.steps >= self._max_steps:
                     st.dropped += 1
                     continue
-                n_keys = min(st.prompt_len, len(st.blocks) * self._block_size)
+                # Groups can page at different block sizes (784 for the
+                # attention group of Qwen3.8-27B), so how much of the prompt is
+                # addressable differs per group. The step-indexed buffers are
+                # shared across groups, so score the prefix every group can
+                # reach; in practice prefill has finished and this is just
+                # st.prompt_len.
+                n_keys = min([st.prompt_len]
+                             + [len(b) * g.layers[0].block_size
+                                for b, g in zip(st.blocks, self._scored)])
                 if st.n_keys:
                     # Frozen with k on the first decode step: the selection plan
                     # and the buffers are sized to it.
@@ -666,7 +708,7 @@ class _WorkerSide:
                             self._warn_no_query(layout.layer_name, n_rows)
                             continue
                         probs = decode_attention(
-                            q[row_i], layout.k_view, st.table, n_keys,
+                            q[row_i], layout.k_view, st.table[gi], n_keys,
                             num_query_heads=self._num_q_heads,
                         )
                         if self._layer_stats and n_keys > 1:
@@ -783,7 +825,7 @@ class _WorkerSide:
     def _emit(self, req_id: str, st: _RequestState) -> None:
         if st.event is not None:
             st.event.synchronize()
-        n_keys = min(st.prompt_len, st.colsum.shape[2])
+        n_keys = min(st.n_keys or st.prompt_len, st.colsum.shape[2])
         if self._tp_rank != 0:
             return
         G, k = st.steps, (st.pos.shape[2] if st.pos is not None else 0)

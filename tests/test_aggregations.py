@@ -139,8 +139,50 @@ def main() -> int:
     test_segments()
     print("\ntensor-parallel owner reduction")
     test_owner_reduction()
+    print()
+    test_group_block_ids()
     print("\nall checks passed")
     return 0
+
+
+# --------------------------------------------------------------------------
+# Per-KV-cache-group block tables.
+# --------------------------------------------------------------------------
+
+def test_group_block_ids() -> None:
+    """Each scored group must be handed its OWN group's block ids.
+
+    StepRequest.new_block_ids carries one block-id list per KV cache group, in
+    kv_cache_groups order. Ground truth from a dump of Qwen/Qwen3.8-27B on vLLM
+    0.28.0 (deploy/runs/kvnorm/dump-groups-3044670.out): 4 groups, 0-2 MambaSpec
+    (48 GDN layers, num_kv_heads=None) and 3 FullAttentionSpec (16 layers,
+    num_kv_heads=4, head_size=256, block_size=784). Only group 3 resolves an
+    attention layout, so the scored gids are [3] and index 0 is a Mamba table.
+    """
+    fn = _load_fns({"_group_block_ids"})["_group_block_ids"]
+    print("per-group block tables")
+
+    qwen = ([11, 12], [21, 22], [31, 32], [41, 42, 43])
+    assert fn(qwen, [3]) == [[41, 42, 43]], "hybrid: must read the attention group"
+    assert fn(qwen, [0]) == [[11, 12]], "index 0 is the Mamba table (the old bug)"
+    print("  ok  hybrid Qwen3.8-27B shape: gid 3 -> group 3's blocks, not group 0's")
+
+    dense = ([5, 6, 7],)
+    assert fn(dense, [0]) == [[5, 6, 7]], "dense: single group at index 0"
+    print("  ok  dense single group unchanged")
+
+    assert fn(qwen, [1, 3]) == [[21, 22], [41, 42, 43]], "scored order preserved"
+    assert fn(qwen, [3, 1]) == [[41, 42, 43], [21, 22]], "scored order preserved"
+    print("  ok  several scored groups keep scored order, each with its own list")
+
+    assert fn(qwen, [9]) == [[]], "gid past the tuple -> nothing to extend"
+    assert fn((), [0]) == [[]], "empty tuple -> nothing to extend"
+    print("  ok  out-of-range and empty tuples degrade to no blocks")
+
+    out = fn(qwen, [3])
+    out[0].append(99)
+    assert qwen[3] == [41, 42, 43], "result must not alias the scheduler's lists"
+    print("  ok  returned lists are copies, so extending never mutates the metadata")
 
 
 # --------------------------------------------------------------------------
@@ -148,19 +190,26 @@ def main() -> int:
 # the module needs vLLM to import, these two functions do not.
 # --------------------------------------------------------------------------
 
-def _load_segment_fns():
+def _load_fns(want: set[str]) -> dict:
+    """Pull named top-level functions out of connector.py without importing it."""
     import ast as _ast
     import pathlib
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "src/vllm_attn_connector/connector.py").read_text()
     tree = _ast.parse(src)
-    want = {"_segment_plan", "_segment_index", "_segmented_topk", "_resolve_owner"}
     mod = _ast.Module(body=[n for n in tree.body
                             if isinstance(n, _ast.FunctionDef) and n.name in want],
                       type_ignores=[])
     ns = {"torch": torch, "NO_ENTRY": -1}
     exec(compile(mod, "<connector>", "exec"), ns)
+    missing = want - set(ns)
+    assert not missing, f"connector.py no longer defines {sorted(missing)}"
     return ns
+
+
+def _load_segment_fns():
+    return _load_fns({"_segment_plan", "_segment_index", "_segmented_topk",
+                      "_resolve_owner"})
 
 
 def test_segments() -> None:

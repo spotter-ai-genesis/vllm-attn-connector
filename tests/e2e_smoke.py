@@ -119,6 +119,17 @@ def validate(buffer: list[dict], *, num_requests: int, top_pct: float,
           "manifest shapes match the arrays")
     # config lives on the workflow, per-request state on the task
     meta = {**wfc, **{k: v for k, v in desc.items() if k != "tensors"}}
+    # Which KV cache group these scores came from. On a hybrid model the
+    # full-attention group is not group 0, and the block table must follow it.
+    # (num_groups/scored_groups/scored_attention/num_layers/num_layers_total
+    # are no longer tracked on the SafeTensors descriptor; they print as None.)
+    print(f"       kv cache groups: scored group_id={meta.get('kv_cache_group_id')} "
+          f"of num_groups={meta.get('num_groups')}, "
+          f"scored_groups={meta.get('scored_groups')}, "
+          f"attention={meta.get('scored_attention')}, "
+          f"layers={meta.get('num_layers')}/{meta.get('num_layers_total')}, "
+          f"query_heads={meta.get('num_query_heads')}, "
+          f"nonfinite_steps={meta.get('decode_steps_nonfinite')}")
     check(t["activity_id"] == "decode_attention",
           f"activity labels the connector (got {t['activity_id']!r})")
     check(meta["metric"] == "decode_attention", "metric label recorded")
