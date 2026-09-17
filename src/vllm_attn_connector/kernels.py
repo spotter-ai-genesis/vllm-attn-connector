@@ -14,7 +14,8 @@ buffer first: a gather would add a full write-and-reread of the keys, roughly
 doubling what is already the dominant memory traffic of decode.
 
 One program handles one (head, physical block). Because a tile is exactly one
-block, the key loads are contiguous despite the paged indirection.
+block, the key loads are contiguous despite the paged indirection. The tile is
+padded to a power of two and masked, since ``block_size`` need not be one.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ if HAS_TRITON:
         k_sb, k_sn, k_sh, k_sd,
         out_sh,
         BLOCK_SIZE: tl.constexpr,
+        PAD_N: tl.constexpr,          # BLOCK_SIZE rounded up to a power of two
         GROUP: tl.constexpr,          # query heads per KV head (GQA fan-out)
         HEAD_SIZE: tl.constexpr,
         PAD_D: tl.constexpr,
@@ -61,9 +63,14 @@ if HAS_TRITON:
         d_ok = d < HEAD_SIZE
         q = tl.load(q_ptr + h * q_sh + d * q_sd, mask=d_ok, other=0.0).to(tl.float32)
 
-        n = tl.arange(0, BLOCK_SIZE)
+        # tl.arange needs a power-of-two extent and a page is not always one:
+        # the full-attention group of Qwen/Qwen3.8-27B pages at block_size=784.
+        # Pad the lane range and mask the surplus, as PAD_D already does for
+        # head_size. For a power-of-two block size PAD_N == BLOCK_SIZE and the
+        # extra mask term is constant-true.
+        n = tl.arange(0, PAD_N)
         tok = blk * BLOCK_SIZE + n
-        tok_ok = tok < n_keys
+        tok_ok = (n < BLOCK_SIZE) & (tok < n_keys)
         block_id = tl.load(block_table_ptr + blk).to(tl.int64)
 
         k = tl.load(
@@ -120,6 +127,7 @@ def decode_attention(
         n_keys, scale,
         *q.stride(), *k_view.stride(), logits.stride(0),
         BLOCK_SIZE=block_size,
+        PAD_N=triton.next_power_of_2(block_size),
         GROUP=group,
         HEAD_SIZE=head_size,
         PAD_D=triton.next_power_of_2(head_size),
