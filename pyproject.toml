@@ -7,6 +7,8 @@ name = "vllm-attn-connector"
 version = "0.1.0"
 description = "Out-of-tree vLLM connector capturing exact per-decode-step attention over the prompt, as Flowcept provenance."
 requires-python = ">=3.10"
+license = "MIT"
+classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = []  # vllm and flowcept provided by the host environment
 
 [tool.setuptools.packages.find]

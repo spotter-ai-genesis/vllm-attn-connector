@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 output/
 flowcept_buffer*.jsonl
+attention_provenance/

@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Exact decode-step attention over the paged prompt keys.
 
 At decode step ``t`` a request contributes exactly one query token, so the

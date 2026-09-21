@@ -26,9 +26,16 @@ pytest tests/test_aggregations.py     # same checks, quiet
 ## `e2e_smoke.py` — needs a GPU and a real engine
 
 Builds an actual vLLM engine with the connector installed, generates, and
-asserts 38 properties of the emitted provenance. Not a pytest module: it takes
+asserts 43-45 properties of the emitted provenance, depending on the
+configuration. Not a pytest module: it takes
 CLI flags to exercise each configuration, and one engine build per run is too
 slow to parametrise.
+
+Almost every assertion reads the statistics **back out of the SafeTensors file**
+through `load_provenance`, not out of the Flowcept record — the record only
+carries a reference. So the round trip is under test, not just the capture: if
+the writer and the loader disagree, or the manifest misdescribes the file, these
+fail.
 
 ```bash
 ROOT=$(cd ../.. && pwd)
@@ -36,13 +43,17 @@ export PYTHONPATH="$PWD/src:$ROOT/flowcept/src"
 export FLOWCEPT_SETTINGS_PATH="$ROOT/flowcept/agent_sandbox/settings.yaml"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
-python tests/e2e_smoke.py                                   # CUDA graphs ON, as served
+python tests/e2e_smoke.py --out-dir /tmp/prov                # CUDA graphs ON, as served
 python tests/e2e_smoke.py --enforce-eager                   # graphs off
 python tests/e2e_smoke.py --ranges                          # variable segments
 python tests/e2e_smoke.py --chunk-size 1 --top-pct 100      # full capture
 python tests/e2e_smoke.py --top-pct 25 --chunk-size 64      # coarser segments
 python tests/e2e_smoke.py --max-steps 32                    # bounded capture
 ```
+
+`--out-dir` defaults to `./attention_provenance`, which is gitignored. Point it
+at a scratch path if you do not want files accumulating in the working tree —
+nothing cleans them up.
 
 Exit status is the number of failed assertions, so these compose in a loop.
 
@@ -52,11 +63,13 @@ and because the test suite forced `enforce_eager=True` it never noticed. Records
 came out structurally perfect and numerically all-zero.
 
 The load-bearing assertions are described in the root README under
-[Validation](../README.md#validation). Two worth restating: **`attn_sum` totals
+[Validation](../README.md#validation). Three worth restating: **`attn_sum` totals
 one softmax unit per decode step**, which is what catches a capture that never
 happened, and **the attention sink is reproduced at three orders of magnitude
 above the median position**, which is what tells you the recomputed scores are
-real rather than plausible-looking.
+real rather than plausible-looking. And **the manifest matches the file** — the
+shapes recorded in `attention_stats.tensors` are exactly what loading produces,
+since a descriptor that disagrees with its data is worse than none.
 
 ## `e2e_example.py` — needs a GPU and a real engine
 
@@ -77,14 +90,16 @@ export PYTHONPATH="$PWD/src:$ROOT/flowcept/src"
 export FLOWCEPT_SETTINGS_PATH="$ROOT/flowcept/agent_sandbox/settings.yaml"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
-python tests/e2e_example.py                      # Qwen3-4B AWQ, the default
+python tests/e2e_example.py --out-dir /tmp/prov  # Qwen3-4B AWQ, the default
 python tests/e2e_example.py --cuda-graphs        # needs >6 GB: 4B + graph pools
 python tests/e2e_example.py --model <hf-id>      # any instruct model
 ```
 
-Asserted: records are emitted for every turn, `segment_mode` is `variable`,
-every declared range survives verbatim as a segment, the prompt and the range
-count grow monotonically, and kept mass + `topk_residual` = 1 per turn.
+Asserted: records are emitted for every turn, `attention_config` is recorded
+once on the workflow, `segment_mode` is `variable`, every declared range
+survives verbatim as a segment, the prompt and the range count grow
+monotonically, and kept mass + `topk_residual` = 1 per turn — each read back
+from that turn's file.
 
 Reported but **not** asserted: how many rounds the model got right, where the
 first mistake fell, and how many later rounds inherited it. A low score is a
@@ -120,8 +135,16 @@ plus graph pools exceeds a 6 GB card. Graph replay is covered by
 `e2e_smoke.py`, which runs graphs-on by default on a 0.5B model; pass
 `--cuda-graphs` here on a larger card to cover both at once.
 
-**Tensor parallelism.** `_reduce_row` combines per-rank slices, and has never
-run with `tp_size > 1`.
+**Tensor parallelism.** Has never run with `tp_size > 1`. The owner reduction
+that makes `topk_head` a global index is unit-tested against a dense argmax at
+world sizes 2, 4 and 8 (`test_owner_reduction`), but that replicates the
+arithmetic without a process group — the `all_gather` path itself is unexercised
+because it needs more than one GPU.
+
+**The write-failure path.** `store.write` catches any error and returns a
+descriptor carrying `error` instead of raising, so capture cannot fail a
+generation request. Nothing tests that an unwritable `out_dir` produces such a
+record rather than an exception.
 
 **Preemption.** The connector detects restarts by watching
 `num_computed_tokens` go backwards, then drops partial records rather than

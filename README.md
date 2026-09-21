@@ -23,9 +23,13 @@ src/vllm_attn_connector/
     probe.py        attention-backend override that copies the decode query
     kernels.py      Triton q.Kt against the paged cache, plus a torch reference
     layout.py       KV cache layout resolution across vLLM backends
+    store.py        SafeTensors writer, and the loader consumers use
 tests/
     test_aggregations.py   pure torch, no GPU or vLLM needed
-    e2e_smoke.py           real engine, asserts 38 properties of the output
+    e2e_smoke.py           real engine, asserts 43-45 properties of the output
+    e2e_example.py         real engine, a 5-round chain with declared ranges
+    bio_example.csv        the chain
+    README.md              what each suite covers, and what is not covered
 ```
 
 > This repository previously held `vllm-kvnorm`, a connector that scored
@@ -123,10 +127,22 @@ with Flowcept("vllm", workflow_id="my-run", workflow_name="my_run"):
             kv_connector="AttnConnector",
             kv_connector_module_path="vllm_attn_connector",
             kv_role="kv_producer",
-            kv_connector_extra_config={"workflow_id": "my-run"},
+            kv_connector_extra_config={"workflow_id": "my-run",
+                                       "out_dir": "/scratch/prov"},
         ),
     )
     llm.generate(["..."], SamplingParams(max_tokens=64))
+```
+
+Each finished request writes one file under `out_dir` and one Flowcept task
+pointing at it. To read the statistics back:
+
+```python
+from vllm_attn_connector import load_provenance
+
+task = ...                                  # a Flowcept task record
+arrays = load_provenance(task)
+arrays["val_all_max"]                       # (decode steps, k)
 ```
 
 Use `kv_role="kv_producer"`, not `"kv_both"` — this connector never loads KV,
@@ -139,6 +155,8 @@ All keys go in `kv_connector_extra_config`.
 | key | default | meaning |
 |---|---|---|
 | `workflow_id` | — | parent workflow to attach records to |
+| `out_dir` | `./attention_provenance` | where the statistics files are written |
+| `checksum` | `true` | record a sha256 of each file; costs a pass over the bytes |
 | `max_steps` | `0` | decode steps recorded per request; `0` = every one |
 | `top_pct` | `10` | percent of positions kept within each segment |
 | `chunk_size` | `32` | segment width when no ranges are declared; `0` = one segment |
@@ -157,6 +175,7 @@ in `decode_steps_dropped` rather than lost quietly.
   "kv_role": "kv_producer",
   "kv_connector_extra_config": {
       "workflow_id": "my-run",
+      "out_dir": "/scratch/prov",
       "top_pct": 10,
       "chunk_size": 32
   }
@@ -209,30 +228,81 @@ segment and keeps all of them. That is the replacement for the dense mode this
 connector used to have: same information, same field names, no separate code
 path.
 
-## Emitted fields
+## What is recorded
 
-Per request, per KV cache group, under `<req>:g<group>`. Write `G` for decode
-steps recorded, `T` for prefill tokens scored, `k` for entries kept per step.
+The statistics do not travel inside the provenance record. They are written to
+one **SafeTensors** file per (request, KV cache group), and the record carries a
+reference. A record is then ~1.6 KB whatever the prompt length; inline, a
+128k-context request serialises to hundreds of megabytes of JSON, past what a
+message queue accepts, and building those Python lists costs a device sync.
 
-**Sparse mode** (default, `top_pct > 0`):
+**On the workflow, once per run** — `attention_config`: the settings that
+produced the files (`top_pct`, `chunk_size`, `max_steps`, `head_code`,
+`num_query_heads`, `num_layers_scored`, `selected_on`, ...). It is constant for
+the engine, so repeating it per task would be duplication that can drift. The
+model and tokenizer are already alongside it in `conf`.
 
-| field | shape | meaning |
+**On each task** — `used` (request id, prompt and decode token counts) and
+`attention_stats`:
+
+```json
+"attention_stats": {
+  "uri": "file:///scratch/prov/<workflow>/<request>_g0.safetensors",
+  "format": "safetensors", "bytes": 110652, "sha256": "...",
+  "kv_cache_group_id": 0, "written_by_tp_rank": 0,
+  "segment_mode": "variable",
+  "decode_steps_dropped": 0, "decode_steps_nonfinite": 0, "restarts": 0,
+  "tensors": {"attn_sum": {"shape": [3540], "dtype": "float32"}, ...}
+}
+```
+
+`segment_mode` and the three health counters stay per-task on purpose: the
+first depends on whether *that* request declared ranges, and the others are how
+a single untrustworthy record is identified.
+
+### Tensors in the file
+
+Write `G` for decode steps recorded, `T` for prefill tokens scored, `k` for
+entries kept per step.
+
+| tensor | shape | meaning |
 |---|---|---|
-| `topk_pos` | `[G, k]` int | retained prefill positions, ascending; `-1` pads the ragged final chunk |
-| `val_all_max` | `[G, k]` | attention at those positions, **max** over all (layer, head) |
-| `val_all_avg` | `[G, k]` | attention at those positions, **mean** over all (layer, head) |
-| `topk_head` | `[G, k]` int | which `layer × num_query_heads + head` supplied the max |
-| `topk_residual` | `[G, 1]` | mean-aggregation mass that selection discarded |
-| `segments` | `[n_seg, 3]` int | the partition, as `(lo, hi, keep)` |
-| `attn_sum` | `[T]` | column sum of the mean row, over **all** positions |
-| `attn_peak` | `[T]` | max over (layer, head, decode step), over **all** positions |
+| `topk_pos` | `[G, k]` int32 | retained prefill positions, ascending; `-1` pads the ragged final segment |
+| `val_all_max` | `[G, k]` f32 | attention at those positions, **max** over all (layer, head) |
+| `val_all_avg` | `[G, k]` f32 | attention at those positions, **mean** over all (layer, head) |
+| `topk_head` | `[G, k]` int32 | which head supplied the max; see `head_code` |
+| `topk_residual` | `[G, 1]` f32 | mean-aggregation mass that selection discarded |
+| `segments` | `[n_seg, 3]` int32 | the partition, as `(lo, hi, keep)` |
+| `attn_sum` | `[T]` f32 | column sum of the mean row, over **all** positions |
+| `attn_peak` | `[T]` f32 | max over (layer, head, decode step), over **all** positions |
+| `prompt_token_ids` | `[T]` int32 | the prompt; decode it with the tokenizer on the workflow |
 
-`segments` covers `[0, prompt_len_scored)` with no gaps or overlaps, so every
-retained position falls in exactly one segment and a `searchsorted` on the
-segment starts maps positions to segments.
+`segments` covers `[0, T)` with no gaps or overlaps, so every retained position
+falls in exactly one segment and a `searchsorted` on the segment starts maps
+positions to segments.
 
 `attn_sum` and `attn_peak` cover every position, including those selection
 dropped, so whole-prompt totals remain available.
+
+With `layer_stats` on, the file also carries the per-head diagnostics
+(`head_argmax_pos`, `head_entropy`, `wins_first_step`, `layer_maxsum`, ...).
+
+### Reading it back
+
+```python
+from vllm_attn_connector import load_provenance, open_lazy
+
+arrays = load_provenance(task_record)      # dict of numpy arrays
+arrays["val_all_max"].shape                # (G, k)
+
+with open_lazy(task_record) as f:          # one tensor out of a large file
+    segs = f.get_tensor("segments")
+```
+
+
+The file also carries a small string header (request id, segment mode,
+`top_pct`, `head_code`), so it stays interpretable if it is separated from the
+provenance store that references it.
 
 ### Why both a max and a mean
 
@@ -264,33 +334,47 @@ yourself: it is never there.
 
 ## Output size
 
-Per request, per KV cache group:
+The provenance record is **flat** — a descriptor, not the data — so it does not
+grow with the prompt. The file does:
 
 ```
-k · G · 4      (positions + 2 values + head id)
-  +  G         (residual)
-  +  2·T       (attn_sum, attn_peak)
-  +  3·n_seg   (the partition)
+floats = k · G · 4      (positions + 2 values + head id)
+       +     G          (residual)
+       +   2·T          (attn_sum, attn_peak)
+       +     T          (prompt_token_ids)
+       + 3·n_seg        (the partition)
 ```
 
-**Size does not depend on the number of heads, layers, or head_size.** Those are
-reduced before anything is stored; they drive *compute*, not output.
+as float32/int32, not text. **Size does not depend on the number of heads,
+layers, or head_size** — those are reduced before anything is stored; they drive
+*compute*, not output.
 
-| variable | meaning | effect on size |
+| variable | meaning | effect on file size |
 |---|---|---|
-| `T` | prefill tokens scored (`prompt_len_scored`) | `2T`, from `attn_sum`/`attn_peak` |
+| `T` | prefill tokens scored | `3T`, from `attn_sum`, `attn_peak`, `prompt_token_ids` |
 | `G` | decode steps recorded: all of them, or `max_steps` if capped | linear |
-| `k` | entries kept per step | linear (sparse only) |
-| `n_groups` | KV cache groups: 1 uniform, 2 for some hybrid models | linear |
+| `k` | entries kept per step | linear |
+| `n_groups` | KV cache groups: 1 uniform, 2 for some hybrid models | one file each |
 | `H`, `L`, `head_size` | heads, layers, head dim | **none** |
-| `FLOAT_DECIMALS`, JSONL | 6 dp text ≈ 2.3× float32 | constant factor |
 
-With the default `max_steps=0`, `G` is the full generation length, so output
-grows with how much the model actually produces. A positive `max_steps` bounds
-it. The `k` factor is under your direct control via `top_pct` and the segment
-widths, which is what keeps long prompts affordable. `metadata` also carries `matrix_shape`, `matrix_fields`,
-`decode_steps_recorded`, `decode_steps_nonfinite`, `restarts`,
-`prompt_len_scored`, `chunk_size`, `per_chunk` and `no_entry_sentinel`.
+Measured on a five-round chain, 953 → 3540 prompt tokens:
+
+| round | T | G | k | record | file |
+|---|---|---|---|---|---|
+| 1 | 953 | 8 | 95 | 1.6 KB | 23 KB |
+| 3 | 2308 | 11 | 231 | 1.6 KB | 67 KB |
+| 5 | 3540 | 12 | 353 | 1.6 KB | 108 KB |
+
+With the default `max_steps=0`, `G` is the full generation length, so the file
+grows with how much the model produces. A positive `max_steps` bounds it. `k` is
+under your direct control via `top_pct` and the segment widths, which is what
+keeps long prompts affordable.
+
+Files are written to `out_dir/<workflow_id>/<request_id>_g<group>.safetensors`
+via a temporary name and an atomic rename, so a reader tailing the directory
+never sees a partial file. A write failure is logged and reported as
+`attention_stats.error` rather than raised — provenance capture must not be able
+to fail a generation request.
 
 ## Performance
 
@@ -339,12 +423,14 @@ python tests/e2e_smoke.py --enforce-eager                 # graphs off
 python tests/e2e_smoke.py --ranges                        # variable segments
 python tests/e2e_smoke.py --chunk-size 1 --top-pct 100    # full capture
 python tests/e2e_smoke.py --top-pct 25 --chunk-size 64
+python tests/e2e_example.py                               # 5-round chain, declared ranges
 ```
 
 See [`tests/README.md`](tests/README.md) for what each covers, and for what is
 *not* covered — preemption and tensor parallelism both lack tests.
 
-The e2e asserts 32 properties. The load-bearing ones:
+The e2e asserts 43-45 properties depending on the configuration. The
+load-bearing ones:
 
 - **`attn_sum` totals one softmax unit per decode step.** Attention is a
   distribution, so this is the check that the scores were actually written. It
@@ -355,6 +441,9 @@ The e2e asserts 32 properties. The load-bearing ones:
   exactly, not a plausible-looking artifact.
 - **The partition is complete**: segments cover the prompt with no gaps or
   overlaps, and every declared range appears verbatim as a segment.
+- **The manifest matches the file**: the tensor names and shapes recorded in
+  `attention_stats` are exactly what reading the file back produces. A
+  descriptor that disagrees with its data is worse than no descriptor.
 - **The attention sink is reproduced** at two to three orders of magnitude above
   the median position. Recovering a known property of the model is evidence the
   recomputation is reading real keys.
@@ -380,6 +469,13 @@ and single-key sequences.
 - **Attention magnitude is not signed.** A head attending strongly to a token
   may be suppressing it as easily as using it. High attention means "this token
   was consulted", not "this token was used affirmatively".
+- **Tensor parallelism is handled but untested.** The owner is reduced
+  alongside the value, so `topk_head` is a global head index at any `tp_size`
+  and always names the head that produced `val_all_max`. That costs one
+  all-gather of `(value, owner)` per step on top of the two all-reduces. Only
+  rank 0 writes, so there is one file per request regardless of `tp_size`. The
+  arithmetic is unit-tested against a dense argmax at world sizes 2, 4 and 8;
+  the path has never run on more than one GPU.
 - **Reduced over layers and heads.** The output cannot tell you *which* layer
   produced a score, only which head supplied the maximum. `layer_stats` exposes
   per-head detail at significant cost.

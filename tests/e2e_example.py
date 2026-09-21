@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Second end-to-end smoke test: a multi-round chain, answered by the model.
 
 `e2e_smoke.py` checks the *provenance* against synthetic prompts. This one
@@ -59,6 +58,8 @@ import csv
 import os
 import re
 from pathlib import Path
+
+from vllm_attn_connector import load_provenance
 
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
@@ -176,7 +177,8 @@ def run(args):
         kv_connector_module_path="vllm_attn_connector",
         kv_role="kv_producer",
         kv_connector_extra_config={"workflow_id": WORKFLOW_ID,
-                                   "top_pct": args.top_pct},
+                                   "top_pct": args.top_pct,
+                                   "out_dir": args.out_dir},
     )
     gen_seconds = 0.0
     with Flowcept("vllm", workflow_id=WORKFLOW_ID, workflow_name="attn_chain") as fc:
@@ -256,7 +258,7 @@ def summarise(turns, buffer, *, top_pct: float) -> int:
             failures.append(msg)
 
     tasks = [r for r in buffer if r.get("type") == "task"
-             and "attn_sum" in r.get("generated", {})]
+             and r.get("attention_stats", {}).get("uri")]
     by_len = {r["used"]["num_prompt_tokens"]: r for r in tasks}
 
     print("\n=== connector ===")
@@ -267,7 +269,13 @@ def summarise(turns, buffer, *, top_pct: float) -> int:
     check(len(covered) >= len(turns) - 1,
           f"a record for each turn (got {len(covered)} of {len(turns)}; the last "
           f"may be lost to buffer flush)")
-    meta = tasks[0]["custom_metadata"]
+    wfc = next((w.get("attention_config") for w in buffer
+                if w.get("type") == "workflow" and w.get("attention_config")), {})
+    check(bool(wfc), "attention_config recorded on the workflow")
+    # config is per-run, the rest per-request; merge so the checks below read
+    # from one place
+    meta = {**wfc, **{k: v for k, v in tasks[0]["attention_stats"].items()
+                      if k != "tensors"}}
     check(meta["segment_mode"] == "variable",
           f"declared ranges were used (segment_mode={meta['segment_mode']!r})")
     check(meta["top_pct"] == top_pct, f"top_pct honoured ({meta['top_pct']})")
@@ -280,7 +288,7 @@ def summarise(turns, buffer, *, top_pct: float) -> int:
 
     for t in covered:
         rec = by_len[t["n_prompt"]]
-        g = rec["generated"]
+        g = {k: v.tolist() for k, v in load_provenance(rec).items()}
         segs = g["segments"]
         declared = {(d["lo"], d["hi"]) for d in t["ranges"]}
         emitted = {(lo, hi) for lo, hi, _k in segs}
@@ -322,7 +330,7 @@ def summarise(turns, buffer, *, top_pct: float) -> int:
     print("\n=== attention on the current round's ranges ===")
     for t in covered:
         rec = by_len[t["n_prompt"]]
-        g = rec["generated"]
+        g = {k: v.tolist() for k, v in load_provenance(rec).items()}
         segs = [(lo, hi) for lo, hi, _k in g["segments"]]
         # peak val_all_max per segment at the final content token, the probe that
         # separates evidence from noise best on this workload
@@ -359,6 +367,8 @@ def main() -> int:
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--top-pct", type=float, default=10.0)
+    ap.add_argument("--out-dir", default="./attention_provenance",
+                    help="where the statistics files are written")
     ap.add_argument("--cudagraph-sizes", type=int, nargs="+", default=[1, 2, 4, 8],
                     help="batch sizes to capture graphs for (single-request chain)")
     ap.add_argument("--no-connector", action="store_true",

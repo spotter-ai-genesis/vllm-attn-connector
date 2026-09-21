@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Attention-backend override that stashes decode queries. The sensor half.
 
 Queries never enter the KV cache -- they are transient activations, consumed and

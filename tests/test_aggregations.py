@@ -98,10 +98,47 @@ def test_reduction() -> None:
     print("         Only the winner (topk_head) is emitted; it is free.")
 
 
+def test_owner_reduction() -> None:
+    """`_resolve_owner` must name the head a single unsharded run would.
+
+    Calls the connector's own function -- not a copy of the formula -- with
+    hand-built gathered tensors, so a change to the real arithmetic fails here.
+    The collectives around it need a process group and more than one GPU; this
+    index arithmetic is the part that can silently be wrong.
+    """
+    resolve = _load_segment_fns()["_resolve_owner"]
+    torch.manual_seed(0)
+    for world, hl, L, T in ((4, 8, 3, 6), (2, 16, 2, 5), (8, 4, 5, 9)):
+        full = torch.rand(L, world * hl, T)          # ground truth: every head
+        V, O = [], []
+        for r in range(world):
+            sl = full[:, r * hl:(r + 1) * hl].reshape(-1, T)
+            v, h = sl.max(0)                         # this rank's max, local code
+            V.append(v)
+            O.append(h)
+        val, own = resolve(torch.stack(V), torch.stack(O).long(), hl)
+
+        want_v, want_c = full.reshape(-1, T).max(0)
+        assert torch.allclose(val, want_v), f"world={world}: value mismatch"
+        assert torch.equal(own, want_c), f"world={world}: global head mismatch"
+        print(f"  ok  world={world:<2} {hl:>2} heads/rank, {L} layers -> "
+              f"{world*hl:>3} global heads, T={T}")
+
+    # -1 marks a position no head has claimed; it must pass through untouched
+    V = torch.tensor([[0.5, 0.1], [0.2, 0.9]])
+    O = torch.tensor([[-1, 3], [2, -1]])
+    _, own = resolve(V, O, 4)
+    assert own[0].item() == -1, "sentinel from the winning rank was re-encoded"
+    assert own[1].item() == -1
+    print("  ok  the -1 no-owner sentinel is preserved")
+
+
 def main() -> int:
     test_reduction()
     print()
     test_segments()
+    print("\ntensor-parallel owner reduction")
+    test_owner_reduction()
     print("\nall checks passed")
     return 0
 
@@ -117,17 +154,19 @@ def _load_segment_fns():
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "src/vllm_attn_connector/connector.py").read_text()
     tree = _ast.parse(src)
-    want = {"_segment_plan", "_segment_index", "_segmented_topk"}
+    want = {"_segment_plan", "_segment_index", "_segmented_topk", "_resolve_owner"}
     mod = _ast.Module(body=[n for n in tree.body
                             if isinstance(n, _ast.FunctionDef) and n.name in want],
                       type_ignores=[])
     ns = {"torch": torch, "NO_ENTRY": -1}
     exec(compile(mod, "<connector>", "exec"), ns)
-    return ns["_segment_plan"], ns["_segment_index"], ns["_segmented_topk"]
+    return ns
 
 
 def test_segments() -> None:
-    plan_fn, index_fn, topk_fn = _load_segment_fns()
+    ns = _load_segment_fns()
+    plan_fn, index_fn, topk_fn = (ns["_segment_plan"], ns["_segment_index"],
+                                  ns["_segmented_topk"])
     torch.manual_seed(0)
 
     def run(n_keys, chunk, pct, ranges, label):

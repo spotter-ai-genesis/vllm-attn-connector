@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """``AttnConnector`` -- exact per-decode-step attention over the prompt.
 
 Two extension points, both public, neither patching vLLM:
@@ -41,6 +40,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +57,9 @@ from vllm.logger import init_logger
 
 from .kernels import decode_attention
 from .layout import LayerLayout, UnsupportedLayout, resolve_layer_layout
+import numpy as np
+
+from . import store
 from .probe import REGISTRY, install
 
 if TYPE_CHECKING:
@@ -81,6 +84,7 @@ DEFAULT_MAX_STEPS = 0
 STEP_CHUNK = 64
 DEFAULT_TOP_PCT = 10.0
 DEFAULT_CHUNK = 32
+DEFAULT_OUT_DIR = "./attention_provenance"
 # Aggregations stored per retained position, both reduced over every
 # (layer, head) pair. `val_all_max` is what selection runs on; `val_all_avg` is
 # a true distribution, which is what makes `topk_residual` exact.
@@ -249,7 +253,7 @@ class _RequestState:
     """
 
     __slots__ = ("blocks", "table", "scratch", "colsum", "pos", "val",
-                 "resid", "dense",
+                 "resid",
                  "prompt_len", "steps", "dropped", "prompt_token_ids", "event", "started",
                  "seen_computed", "restarts", "k", "plan", "seg_idx", "seg_live",
                  "seg_want", "seg_kmax", "ranges", "n_keys", "owner", "head",
@@ -327,7 +331,8 @@ class _RequestState:
         self.hval = ext(self.hval, 2)
 
     def alloc(self, groups: int, max_steps: int, k: int, n_keys: int, device,
-              layer_stats: bool = False, n_layers: int = 0, n_heads: int = 0) -> None:
+              layer_stats: bool = False, n_layers: int = 0, n_heads: int = 0,
+              tp_size: int = 1) -> None:
         steps_cap = self.step_capacity(max_steps)
         if self.scratch is None or self.scratch.shape[2] < n_keys:
             cap = max(256, n_keys)
@@ -346,7 +351,9 @@ class _RequestState:
             # [bucket, groups, layer*heads]: bucket 0 = the first decode token,
             # bucket 1 = every later one. Splitting them tests whether a
             # selection made on step 0 would transfer to the rest.
-            self.lwins = torch.zeros((2, groups, n_layers * n_heads),
+            # Indexed by the owner code, which under TP is a *global* head id,
+            # so this must span every rank's heads or the bincount overruns it.
+            self.lwins = torch.zeros((2, groups, n_layers * n_heads * max(1, tp_size)),
                                      dtype=torch.float64, device=device)
             self.hent = torch.zeros((groups, n_layers * n_heads),
                                     dtype=torch.float64, device=device)
@@ -422,6 +429,7 @@ class _RequestState:
 class _WorkerSide:
     def __init__(self, kv_cache_config, conf, tp_size, workflow_id, parent_workflow_id,
                  max_steps: int, top_pct: float, chunk: int,
+                 out_dir: str = DEFAULT_OUT_DIR, checksum: bool = True,
                  layer_stats: bool = False) -> None:
         from flowcept.flowceptor.adapters.vllm.vllm_interceptor import VLLMInterceptor
 
@@ -435,6 +443,8 @@ class _WorkerSide:
         self._max_steps = max_steps
         self._top_pct = max(0.0, float(top_pct))
         self._chunk = max(0, int(chunk))
+        self._out_dir = Path(out_dir).expanduser().resolve()
+        self._checksum = bool(checksum)
         self._layer_stats = bool(layer_stats)
         self._missing_q = 0
 
@@ -507,7 +517,9 @@ class _WorkerSide:
         self._enabled = True
         if self._tp_rank == 0:
             self._interceptor.send_model_workflow(
-                self._workflow_id, self._conf, parent_workflow_id=self._parent_workflow_id
+                self._workflow_id, self._conf,
+                parent_workflow_id=self._parent_workflow_id,
+                attention_config=self._attention_config()
             )
         logger.info(
             "attn_connector: %d layers in %d group(s), %d query heads / %d kv heads, "
@@ -642,7 +654,7 @@ class _WorkerSide:
                 k = st.k
                 st.alloc(len(self._scored), self._max_steps, k, n_keys, device,
                          self._layer_stats, max(len(g.layers) for g in self._scored),
-                         self._num_q_heads)
+                         self._num_q_heads, self._tp_size)
                 g_idx = st.steps
                 for gi, group in enumerate(self._scored):
                     row = st.scratch[gi, :, :n_keys]
@@ -706,8 +718,13 @@ class _WorkerSide:
                     row[0] /= max(1, len(group.layers))
                     if self._tp_size > 1:
                         # Each rank owns a head slice, so the row must be whole
-                        # before selection reads it.
-                        row.copy_(_reduce_row(row))
+                        # before selection reads it -- and the owner must be
+                        # re-encoded into a global head index, or topk_head
+                        # would name a head on whichever rank happened to emit.
+                        red, own = _reduce_row(row, st.owner[gi, :n_keys],
+                                               self._num_q_heads)
+                        row.copy_(red)
+                        st.owner[gi, :n_keys] = own
                     # Column aggregates are O(T) once, not per step: keep them
                     # in both modes so the summed view is never lost.
                     st.colsum[gi, 0, :n_keys] += row[0]
@@ -770,17 +787,16 @@ class _WorkerSide:
         if self._tp_rank != 0:
             return
         G, k = st.steps, (st.pos.shape[2] if st.pos is not None else 0)
+        npy = lambda t, dt: t.detach().cpu().numpy().astype(dt, copy=False)
 
         for gi, group in enumerate(self._scored):
-            payload = {
-                "attn_sum": st.colsum[gi, 0, :n_keys],
-                "attn_peak": st.colsum[gi, 1, :n_keys],
+            tensors = {
+                "attn_sum": npy(st.colsum[gi, 0, :n_keys], "float32"),
+                "attn_peak": npy(st.colsum[gi, 1, :n_keys], "float32"),
+                "prompt_token_ids": np.asarray(st.prompt_token_ids, dtype="int32"),
             }
-            payload = {a: b.double().round(decimals=FLOAT_DECIMALS).tolist()
-                       for a, b in payload.items()}
-            meta_extra: dict[str, Any] = {}
+            n_bad = 0
             if k:
-                pos = st.pos[gi, :G]
                 mean = st.val[gi, 1, :G]
                 # Non-finite rows can only come from scoring recycled blocks;
                 # drop them rather than let one poisoned step propagate.
@@ -790,79 +806,94 @@ class _WorkerSide:
                     logger.warning("attn_connector: %s group %d: %d/%d step(s) "
                                    "non-finite, zeroed.", req_id, group.gid, n_bad, G)
                     mean = torch.where(finite[:, None], mean, 0.0)
-                payload["topk_pos"] = pos.tolist()
-                payload["topk_head"] = st.head[gi, :G].tolist()
-                for j, name in enumerate(AGG_FIELDS):
-                    v = mean if j == 1 else st.val[gi, j, :G]
-                    payload[name] = (v.double()
-                                     .round(decimals=FLOAT_DECIMALS).tolist())
+                tensors["topk_pos"] = npy(st.pos[gi, :G], "int32")
+                tensors["topk_head"] = npy(st.head[gi, :G], "int32")
+                tensors["val_all_max"] = npy(st.val[gi, 0, :G], "float32")
+                tensors["val_all_avg"] = npy(mean, "float32")
                 # [G, 1] rather than flat: it is per decode token, not per
-                # prefill token, and a bare list would be read as the latter.
-                payload["topk_residual"] = (st.resid[gi, :G, None].double()
-                                            .round(decimals=FLOAT_DECIMALS).tolist())
-                # The partition every retained position belongs to, [n_seg, 3]
-                # as (lo, hi, keep). Emitted whether the segments came from a
-                # uniform grid or the caller's own ranges, so a consumer runs
-                # the same per-segment aggregation either way and never has to
-                # know which mode produced the record.
-                payload["segments"] = [[lo, hi, keep] for lo, hi, keep in st.plan]
-                meta_extra = {
-                    "top_pct": self._top_pct, "top_k": k,
-                    "segment_mode": "variable" if st.ranges else "fixed",
-                    "chunk_size": 0 if st.ranges else self._chunk,
-                    "n_segments": len(st.plan),
-                    "no_entry_sentinel": NO_ENTRY,
-                    "matrix_fields": ["topk_pos", "topk_head", *AGG_FIELDS,
-                                      "topk_residual"],
-                    "segments_layout": "[n_segments, 3] as (lo, hi, keep); "
-                                       "covers [0, prompt_len_scored) with no "
-                                       "gaps or overlaps",
-                    "aggregations": {
-                        "val_all_max": "max over all (layer, head)",
-                        "val_all_avg": "mean over all (layer, head)",
-                    },
-                    "head_code": "layer * num_query_heads + head",
-                    "matrix_shape": [G, k], "decode_steps_nonfinite": n_bad}
+                # prefill token, and a flat vector would be read as the latter.
+                tensors["topk_residual"] = npy(st.resid[gi, :G, None], "float32")
+                # The partition every retained position belongs to, (lo, hi,
+                # keep), whether it came from a uniform grid or the caller's
+                # declared ranges.
+                tensors["segments"] = np.asarray(st.plan, dtype="int32").reshape(-1, 3)
+            if self._layer_stats and st.lwins is not None:
+                tensors["head_argmax_pos"] = npy(st.hpos[gi, :, :G], "int32")
+                tensors["head_argmax_val"] = npy(st.hval[gi, :, :G], "float32")
+                cnt = st.hcnt[gi].clamp_min(1)
+                tensors["head_offsink_mass"] = npy(st.hmass[gi] / cnt, "float32")
+                tensors["head_entropy"] = npy(st.hent[gi] / cnt, "float32")
+                tensors["head_deviation"] = npy(st.hdev[gi] / cnt, "float32")
+                tensors["wins_first_step"] = npy(st.lwins[0, gi], "float32")
+                tensors["wins_later_steps"] = npy(st.lwins[1, gi], "float32")
+                tensors["layer_maxsum"] = npy(st.lsum[gi], "float32")
+
+            mode = "variable" if st.ranges else "fixed"
+            # The header makes the file interpretable on its own, away from the
+            # provenance store that references it.
+            desc = store.write(
+                self._out_dir, self._workflow_id, req_id, group.gid, tensors,
+                header={"request_id": req_id, "workflow_id": self._workflow_id,
+                        "kv_cache_group_id": str(group.gid), "segment_mode": mode,
+                        "top_pct": str(self._top_pct),
+                        "no_entry_sentinel": str(NO_ENTRY),
+                        "head_code": self._head_code()},
+                checksum=self._checksum)
+            desc.update(kv_cache_group_id=group.gid,
+                        written_by_tp_rank=self._tp_rank,
+                        segment_mode=mode,
+                        decode_steps_dropped=st.dropped,
+                        decode_steps_nonfinite=n_bad,
+                        restarts=st.restarts)
 
             self._interceptor.capture_request(
                 workflow_id=self._workflow_id,
                 request_id=f"{req_id}:g{group.gid}",
-                series=payload,
-                prompt_token_ids=st.prompt_token_ids,
+                attention_stats=desc,
+                num_prompt_tokens=n_keys,
+                num_decode_tokens=G,
                 started_at=st.started,
                 activity=ACTIVITY,
-                metadata={
-                    "metric": "decode_attention",
-                    "metric_reference": "exact softmax(q_t . K_prompt^T / sqrt(d))",
-                    "aggregation": "mean and max over (layer, head) within this group",
-                    "topk_selected_on": "max" if k else None,
-                    "decode_steps_recorded": G,
-                    "decode_steps_dropped": st.dropped,
-                    "restarts": st.restarts,
-                    "prompt_len_scored": n_keys,
-                    "kv_cache_group_id": group.gid,
-                    "num_groups": self._num_groups,
-                    "scored_groups": len(self._scored),
-                    "num_layers": len(group.layers),
-                    "num_layers_total": self._num_layers_total,
-                    "scored_attention": group.kind,
-                    "attention_window": group.window,
-                    "num_query_heads": self._num_q_heads,
-                    "num_tokens": n_keys,
-                    **({"head_argmax_pos": st.hpos[gi, :, :G].tolist(),
-                        "head_argmax_val": st.hval[gi, :, :G]
-                                             .round(decimals=5).tolist(),
-                        "head_offsink_mass": (st.hmass[gi] / st.hcnt[gi].clamp_min(1)).tolist(),
-                        "head_entropy": (st.hent[gi] / st.hcnt[gi].clamp_min(1)).tolist(),
-                        "head_deviation": (st.hdev[gi] / st.hcnt[gi].clamp_min(1)).tolist(),
-                        "wins_first_step": st.lwins[0, gi].tolist(),
-                        "wins_later_steps": st.lwins[1, gi].tolist(),
-                        "n_heads_per_layer": self._num_q_heads,
-                        "layer_maxsum": st.lsum[gi].tolist()}
-                       if st.lwins is not None else {}),
-                    **meta_extra,
-                },
             )
+
+    def _head_code(self) -> str:
+        """How to read `topk_head`: a global head index in both TP regimes.
+
+        Under TP the owner is reduced alongside the value (see `_reduce_row`),
+        so the id always names the head that actually produced `val_all_max`,
+        whichever rank held it. `num_query_heads` in this config is per-rank, so
+        the multiplier here is the global count.
+        """
+        return f"layer * {self._num_q_heads * self._tp_size} + head"
+
+    def _attention_config(self) -> dict[str, Any]:
+        """Settings constant for this engine, recorded once on the workflow.
+
+        Per-request values stay on the task: `segment_mode` depends on whether
+        that request declared ranges, and the health counters are how a single
+        bad record is identified.
+        """
+        return {
+            "connector": "vllm-attn-connector",
+            "metric": "decode_attention",
+            "metric_reference": "exact softmax(q_t . K_prompt^T / sqrt(d))",
+            "selected_on": "val_all_max",
+            "top_pct": self._top_pct,
+            "chunk_size": self._chunk,
+            "max_steps": self._max_steps,
+            "no_entry_sentinel": NO_ENTRY,
+            "head_code": self._head_code(),
+            "num_layers_scored": max((len(g.layers) for g in self._scored), default=0),
+            # Needed to decode topk_head, so it is a field rather than only a
+            # number embedded in head_code. Per-rank under TP, matching how the
+            # ids are encoded.
+            "num_query_heads": self._num_q_heads,
+            "attention_window": self._scored[0].window if self._scored else None,
+            "sink_excluded_from_selection": True,
+            "tensor_parallel_size": self._tp_size,
+            "layer_stats": self._layer_stats,
+            "out_dir": str(self._out_dir),
+        }
 
     def take_emitted(self) -> AttnWorkerMeta | None:
         if not self._emitted:
@@ -964,26 +995,67 @@ def _segmented_topk(row: torch.Tensor, idx, live, want, total: int, kmax: int):
     return pos[order][:total].to(torch.int32), val[order][:total]
 
 
-def _reduce_row(row: torch.Tensor) -> torch.Tensor:
-    """Combine one step's (2, n_keys) row across TP ranks.
+def _resolve_owner(V: torch.Tensor, O: torch.Tensor, heads_per_rank: int):
+    """Pick the winning rank per position and re-encode its head as global.
+
+    `V` and `O` are [world, n_keys]: each rank's max and the local code of the
+    head that produced it. A local code is ``layer * heads_per_rank + head``,
+    which means nothing outside its rank, so the winner's is rebuilt as::
+
+        layer * (heads_per_rank * world) + rank * heads_per_rank + head
+
+    Split out of `_reduce_row` because it is the part that can silently be
+    wrong, and because it is testable: the collectives need a process group and
+    more than one GPU, this index arithmetic needs neither. The `-1` used before
+    any head has claimed a position passes through untouched.
+    """
+    best = V.argmax(0)
+    win = O.gather(0, best.unsqueeze(0)).squeeze(0)
+    glob = ((win // heads_per_rank) * (heads_per_rank * V.shape[0])
+            + best * heads_per_rank + (win % heads_per_rank))
+    return (V.gather(0, best.unsqueeze(0)).squeeze(0),
+            torch.where(win < 0, win, glob))
+
+
+def _reduce_row(row: torch.Tensor, owner: torch.Tensor, heads_per_rank: int):
+    """Combine one step's (2, n_keys) row and its owner across TP ranks.
 
     Means add then divide, maxima take a maximum: each rank owns a disjoint
-    slice of the KV heads. Done per step because top-k must select from the
+    slice of the query heads. Done per step because selection must run on the
     whole row, not this rank's part of it.
+
+    The owner needs more than a max. Each rank's `owner` holds
+    ``layer * heads_per_rank + local_head``, which means nothing outside that
+    rank -- rank 1's head 0 is global head `heads_per_rank`. So all-gather the
+    (value, owner) pairs, take the argmax *rank* per position, and re-encode
+    that rank's local head as a global one::
+
+        global = layer * (heads_per_rank * world) + rank * heads_per_rank + local
+
+    Reducing the value alone would leave `topk_head` naming rank 0's local
+    winner even when another rank held the max, so the id and the value beside
+    it would disagree.
     """
     import torch.distributed as dist
 
     from vllm.distributed.parallel_state import get_tp_group
 
     grp = get_tp_group().device_group
+    world = dist.get_world_size(grp)
+
     out = row.clone()
     m = out[0].contiguous()
     dist.all_reduce(m, op=dist.ReduceOp.SUM, group=grp)
-    out[0] = m / dist.get_world_size(grp)
-    x = out[1].contiguous()
-    dist.all_reduce(x, op=dist.ReduceOp.MAX, group=grp)
-    out[1] = x
-    return out
+    out[0] = m / world
+
+    vals = [torch.empty_like(row[1]) for _ in range(world)]
+    owns = [torch.empty_like(owner) for _ in range(world)]
+    dist.all_gather(vals, row[1].contiguous(), group=grp)
+    dist.all_gather(owns, owner.contiguous(), group=grp)
+    val, own = _resolve_owner(torch.stack(vals), torch.stack(owns).long(),
+                              heads_per_rank)
+    out[1] = val
+    return out, own.to(owner.dtype)
 
 
 class AttnConnector(KVConnectorBase_V1, SupportsHMA):
@@ -1035,6 +1107,8 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
                 max_steps=int(extra.get("max_steps", DEFAULT_MAX_STEPS)),
                 top_pct=float(extra.get("top_pct", DEFAULT_TOP_PCT)),
                 chunk=int(extra.get("chunk_size", DEFAULT_CHUNK)),
+                out_dir=str(extra.get("out_dir", DEFAULT_OUT_DIR)),
+                checksum=bool(extra.get("checksum", True)),
                 layer_stats=bool(extra.get("layer_stats", False)),
             )
 

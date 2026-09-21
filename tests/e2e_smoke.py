@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """End-to-end smoke test for the exact-attention connector.
 
 Boots vLLM with the query probe installed and `AttnConnector` attached, then
@@ -13,6 +12,10 @@ from __future__ import annotations
 import argparse
 import os
 import statistics as st
+
+import numpy as np
+
+from vllm_attn_connector import load_provenance
 
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
@@ -57,6 +60,7 @@ def run(args) -> list[dict]:
                 kv_connector_module_path="vllm_attn_connector",
                 kv_role="kv_producer",
                 kv_connector_extra_config={"workflow_id": WORKFLOW_ID,
+                                           "out_dir": args.out_dir,
                                            "max_steps": args.max_steps,
                                            "top_pct": args.top_pct,
                                            "chunk_size": args.chunk_size},
@@ -96,7 +100,25 @@ def validate(buffer: list[dict], *, num_requests: int, top_pct: float,
         return 1
 
     t = tasks[0]
-    meta = t["custom_metadata"]
+    wfc = next((w.get("attention_config") for w in buffer
+                if w.get("type") == "workflow" and w.get("attention_config")), None)
+    check(wfc is not None, "attention_config recorded once on the workflow")
+    if wfc is None:
+        return 1
+    desc = t["attention_stats"]
+    check(desc.get("uri") is not None,
+          f"statistics file written ({desc.get('error', 'no error reported')})")
+    if desc.get("uri") is None:
+        return 1
+    # Everything below reads the arrays back out of the file. The record itself
+    # carries only the reference, so a record no longer grows with the prompt.
+    gen = {k: v.tolist() for k, v in load_provenance(t).items()}
+    check(sorted(desc["tensors"]) == sorted(gen),
+          "manifest lists exactly the tensors in the file")
+    check(all(list(np.shape(gen[k])) == v["shape"] for k, v in desc["tensors"].items()),
+          "manifest shapes match the arrays")
+    # config lives on the workflow, per-request state on the task
+    meta = {**wfc, **{k: v for k, v in desc.items() if k != "tensors"}}
     check(t["activity_id"] == "decode_attention",
           f"activity labels the connector (got {t['activity_id']!r})")
     check(meta["metric"] == "decode_attention", "metric label recorded")
@@ -104,26 +126,28 @@ def validate(buffer: list[dict], *, num_requests: int, top_pct: float,
     check(num_requests <= len(reqs) <= num_requests + 1,
           f"one record set per prompt (got {len(reqs)})")
 
-    gen = t["generated"]
     expected = sorted(["attn_sum", "attn_peak", "segments", "topk_head", "topk_pos",
-                       "topk_residual", "val_all_avg", "val_all_max"])
-    check(sorted(gen) == expected, f"emitted fields (got {sorted(gen)})")
+                       "topk_residual", "val_all_avg", "val_all_max",
+                       "prompt_token_ids"])
+    check(sorted(gen) == expected, f"tensors in the file (got {sorted(gen)})")
     if sorted(gen) != expected:
         return 1
-    steps, width = meta["matrix_shape"]
-    n_keys = meta["prompt_len_scored"]
+    steps = len(gen["topk_pos"])
+    width = len(gen["topk_pos"][0])
+    n_keys = len(gen["attn_sum"])
 
     # The segment partition is the contract: everything else is indexed by it,
     # and it is emitted so a consumer never needs to know which mode produced it.
     segs = [tuple(r) for r in gen["segments"]]
-    check(len(segs) == meta["n_segments"], f"n_segments agrees ({len(segs)})")
+    check(len(segs) == desc["tensors"]["segments"]["shape"][0],
+          f"segments manifest agrees ({len(segs)})")
     check(segs[0][0] == 0 and segs[-1][1] == n_keys,
           f"segments cover [0, {n_keys}) (got {segs[0][0]}..{segs[-1][1]})")
     check(all(a[1] == b[0] for a, b in zip(segs, segs[1:])),
           "segments have no gaps or overlaps")
     check(all(lo < hi for lo, hi, _ in segs), "every segment is non-empty")
     eff_k = sum(keep for _, _, keep in segs)
-    check(meta["top_k"] == eff_k, f"k is the sum of per-segment quotas ({eff_k})")
+    check(width == eff_k, f"k is the sum of per-segment quotas ({eff_k})")
 
     if ranges:
         check(meta["segment_mode"] == "variable",
@@ -215,7 +239,7 @@ def validate(buffer: list[dict], *, num_requests: int, top_pct: float,
 
     heads = gen["topk_head"]
     check(all(len(r) == eff_k for r in heads), "topk_head rows are k wide")
-    nh = meta.get("num_query_heads", 0) * meta.get("num_layers", 0)
+    nh = meta["num_query_heads"] * meta["num_layers_scored"]
     flat_h = [h for r in heads for h in r]
     check(all(h == -1 or 0 <= h < nh for h in flat_h),
           f"head codes are -1 or in [0, L*H={nh})")
@@ -280,6 +304,8 @@ def main() -> int:
                          "to survive graph replay")
     ap.add_argument("--ranges", action="store_true",
                     help="declare per-request prompt ranges (variable segments)")
+    ap.add_argument("--out-dir", default="./attention_provenance",
+                    help="where the statistics files are written")
     ap.add_argument("--max-steps", type=int, default=0,
                     help="decode steps recorded; 0 (default) = every one")
     ap.add_argument("--top-pct", type=float, default=10.0,

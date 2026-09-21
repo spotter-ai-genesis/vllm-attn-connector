@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Model-agnostic resolution of paged KV cache tensors into canonical K/V views.
 
 VENDORED -- third copy (vllm-kvnorm, vllm-expected-attn, here), identical apart
