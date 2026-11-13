@@ -68,6 +68,12 @@ WORKFLOW_ID = "attn-connector-chain-smoke"
 INSTRUCTION = ("You are answering a self-contained data-analysis question. Work only "
                "from the text given. Reply with exactly one line, starting 'ANSWER:'.")
 ANSWER_RE = re.compile(r"ANSWER\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+# An assistant turn's answer, under either chat template this test is run with:
+# ChatML (Qwen) or Llama 3 headers. Matching only one silently drops every
+# answer range -- the ranges still grow per turn, so no assertion catches it.
+ASSISTANT_ANSWER_RE = re.compile(
+    r"(?:<\|im_start\|>assistant\n"
+    r"|<\|start_header_id\|>assistant<\|end_header_id\|>\n\n)(ANSWER: [^<]*)")
 
 
 def load_rounds() -> list[dict]:
@@ -139,7 +145,7 @@ def declare_ranges(text: str, tok) -> list[dict]:
         lo, hi = tspan(s, e)
         if lo is not None and hi > lo:
             out.append({"kind": m.group(1), "lo": lo, "hi": hi})
-    for m in re.finditer(r"<\|im_start\|>assistant\n(ANSWER: [^<]*)", text):
+    for m in re.finditer(ASSISTANT_ANSWER_RE, text):
         lo, hi = tspan(m.start(1), m.end(1))
         if lo is not None and hi > lo:
             out.append({"kind": "answer", "lo": lo, "hi": hi})
@@ -156,7 +162,7 @@ def declare_ranges(text: str, tok) -> list[dict]:
 def run(args):
     import time
 
-    from vllm import LLM, SamplingParams
+    from vllm import LLM, SamplingParams, TokensPrompt
     from vllm.config import KVTransferConfig
 
     if not args.no_connector:
@@ -187,6 +193,14 @@ def run(args):
             kv_transfer_config=kv_cfg,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            # Profiling runs a dummy batch of this many tokens, and the logits
+            # it materialises are batch x vocab. On a large-vocab model that
+            # spike, not the weights, is what exhausts a small card: Llama 3.1's
+            # 128k vocab at the 8192 default needs ~2.1 GiB on top of 5.3 GiB of
+            # weights. This chain is one request per turn, so the default buys
+            # nothing. Left as None for the 4B default model, which fits.
+            **({"max_num_batched_tokens": args.max_num_batched_tokens}
+               if args.max_num_batched_tokens else {}),
             # This chain is one request per turn, so capturing the full default
             # ladder of ~35 batch sizes buys nothing and its pools do not fit
             # alongside a 4B model on a small card. Both arms of an overhead
@@ -201,13 +215,24 @@ def run(args):
             enforce_eager=not args.cuda_graphs,
         )
         # The model's OWN answers are the history. Nothing here is repaired with
-        # ground truth, so an early mistake stays in the context.
+        # ground truth, so an early mistake stays in the context -- unless
+        # --ground-truth-history is set, which teacher-forces each turn and so
+        # measures the rounds independently, with no poisoning between them.
         msgs = [{"role": "system", "content": INSTRUCTION}]
         for row in rounds:
             msgs.append({"role": "user", "content": row["prompt"]})
             text = tok.apply_chat_template(msgs, add_generation_prompt=True,
                                            tokenize=False)
-            n_prompt = len(tok(text, add_special_tokens=False)["input_ids"])
+            # Tokenize here, not in the engine, and hand the ids over directly.
+            # A chat template that writes its own BOS -- Llama 3 does, ChatML
+            # does not -- would otherwise get a second one from the tokenizer's
+            # post-processor, because vLLM encodes a str prompt with
+            # add_special_tokens=True. That shifts every declared range by one
+            # token against the sequence the model actually ran, and leaves a
+            # duplicate BOS for attention to sink into. Passing ids makes the
+            # range indices and `n_prompt` true by construction.
+            prompt_ids = tok(text, add_special_tokens=False)["input_ids"]
+            n_prompt = len(prompt_ids)
             if n_prompt + args.max_tokens + 16 > args.max_model_len:
                 print(f"  round {row['round_no']}: stopping, {n_prompt} prompt tokens "
                       f"exceeds the context window")
@@ -219,11 +244,14 @@ def run(args):
                                             {"ranges": [[d["lo"], d["hi"]]
                                                         for d in ranges]}})
             _t0 = time.perf_counter()
-            out = llm.generate([text], sp, use_tqdm=False)[0].outputs[0]
+            out = llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sp,
+                               use_tqdm=False)[0].outputs[0]
             gen_seconds += time.perf_counter() - _t0
             got = parse_answer(out.text)
             ok = same(got, row["correct_answer"])
-            msgs.append({"role": "assistant", "content": out.text.strip()})
+            msgs.append({"role": "assistant",
+                         "content": f"ANSWER: {row['correct_answer']}"
+                         if args.ground_truth_history else out.text.strip()})
             shortcut = next((name for name, wrong
                              in ablations(row["explanation"]).items()
                              if matches_ablation(got, wrong)), None) if not ok else None
@@ -365,6 +393,9 @@ def main() -> int:
     ap.add_argument("--model", default="cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=None,
+                    help="cap vLLM's profiling batch; needed for large-vocab "
+                         "models on small cards (see the LLM() call)")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--top-pct", type=float, default=10.0)
     ap.add_argument("--out-dir", default="./attention_provenance",
@@ -373,6 +404,10 @@ def main() -> int:
                     help="batch sizes to capture graphs for (single-request chain)")
     ap.add_argument("--no-connector", action="store_true",
                     help="baseline: run the identical workload with no capture")
+    ap.add_argument("--ground-truth-history", action="store_true",
+                    help="teacher-force: put the correct answer in the history "
+                         "instead of the model's own, so rounds are measured "
+                         "independently of each other")
     ap.add_argument("--cuda-graphs", action="store_true",
                     help="enable CUDA graphs; off by default here because this "
                          "test's 4B model plus graph pools needs >6 GB")
